@@ -35,6 +35,10 @@ use super::{StageInput, StageProcessor, finish, generation};
 use crate::{DetectionModel, ModelCell};
 
 const MODEL_ID: &str = "mayocream/koharu-layout-rfdetr-seg-2xl-1152";
+
+#[cfg(test)]
+#[path = "detection_concurrency_probe.rs"]
+mod concurrency_probe;
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
 const PRODUCER: &str = "dev.koharu.pipeline.detection";
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
@@ -416,6 +420,12 @@ fn write_region<'a>(
             stroke_width: inferred.and_then(|value| value.stroke_width),
             alignment: None,
             writing_mode: inferred.map(|value| value.writing_mode),
+            placement: None,
+            shear_x: None,
+            shear_y: None,
+            shadow: None,
+            glow: None,
+            gradient: None,
             extensions: Default::default(),
         },
     )

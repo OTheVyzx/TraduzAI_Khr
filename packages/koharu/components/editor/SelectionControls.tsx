@@ -1,15 +1,17 @@
 'use client'
 
-import { useRef, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
+import { useRef, useState, type PointerEvent as ReactPointerEvent, type RefObject } from 'react'
 
 import {
   cssFrame,
   pagePoint,
+  resizeFontScale,
   resizeFrame,
   rotateFrame,
   type Camera,
   type ResizeHandle,
 } from '@/lib/geometry'
+import type { ResizeMode } from '@/lib/store'
 import type { EntityId, Frame, Point, TransformFrame } from '@koharu/bridge/protocol'
 
 interface SelectionControlsProps {
@@ -18,14 +20,31 @@ interface SelectionControlsProps {
   frame: Frame
   camera: Camera
   edgesOnly: boolean
+  fontSize?: number
+  resizeMode: ResizeMode
+  shearX?: number
+  shearY?: number
+  onShearStart?: (axis: ShearAxis) => void
+  onShearPreview?: (axis: ShearAxis, shear: number) => void
+  onShearEnd?: (axis: ShearAxis, shear: number) => void
   onTransformStart: (elements: TransformFrame[]) => void
   onTransformFrame: (elements: TransformFrame[]) => void
-  onTransformEnd: () => void
+  onTransformEnd: (resize?: { element: EntityId; size: number }) => void
 }
 
 type ControlGesture =
-  | { kind: 'resize'; pointer: number; original: Frame; handle: ResizeHandle }
+  | { kind: 'resize'; pointer: number; original: Frame; latest: Frame; handle: ResizeHandle }
   | { kind: 'rotate'; pointer: number; original: Frame; start: Point }
+  | {
+      kind: 'shear'
+      axis: ShearAxis
+      pointer: number
+      start: Point
+      original: number
+      latest: number
+    }
+
+type ShearAxis = 'x' | 'y'
 
 const handles: Array<{
   handle: ResizeHandle
@@ -49,11 +68,19 @@ export function SelectionControls({
   frame,
   camera,
   edgesOnly,
+  fontSize,
+  resizeMode,
+  shearX,
+  shearY,
+  onShearStart,
+  onShearPreview,
+  onShearEnd,
   onTransformStart,
   onTransformFrame,
   onTransformEnd,
 }: SelectionControlsProps) {
   const gesture = useRef<ControlGesture | null>(null)
+  const [previewShear, setPreviewShear] = useState<{ axis: ShearAxis; value: number } | null>(null)
   const position = cssFrame(frame, camera)
 
   const eventPoint = (event: ReactPointerEvent<HTMLDivElement>): Point | null => {
@@ -70,7 +97,13 @@ export function SelectionControls({
   const startResize = (handle: ResizeHandle) => (event: ReactPointerEvent<HTMLDivElement>) => {
     if (event.button !== 0 || gesture.current) return
     capture(event)
-    gesture.current = { kind: 'resize', pointer: event.pointerId, original: frame, handle }
+    gesture.current = {
+      kind: 'resize',
+      pointer: event.pointerId,
+      original: frame,
+      latest: frame,
+      handle,
+    }
     onTransformStart([{ element, frame }])
   }
 
@@ -83,6 +116,22 @@ export function SelectionControls({
     onTransformStart([{ element, frame }])
   }
 
+  const startShear = (axis: ShearAxis) => (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0 || gesture.current || !onShearEnd) return
+    const start = eventPoint(event)
+    if (!start) return
+    capture(event)
+    gesture.current = {
+      kind: 'shear',
+      axis,
+      pointer: event.pointerId,
+      start,
+      original: axis === 'x' ? (shearX ?? 0) : (shearY ?? 0),
+      latest: axis === 'x' ? (shearX ?? 0) : (shearY ?? 0),
+    }
+    onShearStart?.(axis)
+  }
+
   const update = (event: ReactPointerEvent<HTMLDivElement>) => {
     const current = gesture.current
     if (!current || current.pointer !== event.pointerId) return
@@ -90,6 +139,20 @@ export function SelectionControls({
     event.stopPropagation()
     const point = eventPoint(event)
     if (!point) return
+    if (current.kind === 'shear') {
+      const angle = (frame.angle_degrees * Math.PI) / 180
+      const localX =
+        (point.x - current.start.x) * Math.cos(angle) +
+        (point.y - current.start.y) * Math.sin(angle)
+      const localY =
+        -(point.x - current.start.x) * Math.sin(angle) +
+        (point.y - current.start.y) * Math.cos(angle)
+      const delta = current.axis === 'x' ? localX / frame.height : localY / frame.width
+      current.latest = Math.max(-4, Math.min(4, current.original + delta))
+      setPreviewShear({ axis: current.axis, value: current.latest })
+      onShearPreview?.(current.axis, current.latest)
+      return
+    }
     const next =
       current.kind === 'resize'
         ? resizeFrame(
@@ -99,6 +162,7 @@ export function SelectionControls({
             window.devicePixelRatio / camera.zoom,
           )
         : rotateFrame(current.original, current.start, point)
+    if (current.kind === 'resize') current.latest = next
     onTransformFrame([{ element, frame: next }])
   }
 
@@ -111,13 +175,36 @@ export function SelectionControls({
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId)
     }
-    onTransformEnd()
+    if (current.kind === 'shear') {
+      setPreviewShear(null)
+      onShearEnd?.(current.axis, current.latest)
+      return
+    }
+    const resize =
+      current.kind === 'resize' && resizeMode === 'scale' && fontSize && fontSize > 0
+        ? {
+            element,
+            size: Math.max(
+              0.5,
+              Math.min(
+                300,
+                fontSize * resizeFontScale(current.original, current.latest, current.handle),
+              ),
+            ),
+          }
+        : undefined
+    onTransformEnd(resize)
   }
 
   const lostCapture = (event: ReactPointerEvent<HTMLDivElement>) => {
     const current = gesture.current
     if (!current || current.pointer !== event.pointerId) return
     gesture.current = null
+    if (current.kind === 'shear') {
+      setPreviewShear(null)
+      onShearEnd?.(current.axis, current.latest)
+      return
+    }
     onTransformEnd()
   }
 
@@ -137,7 +224,7 @@ export function SelectionControls({
         top: position.top,
         width: position.width,
         height: position.height,
-        transform: `rotate(${position.angle}deg)`,
+        transform: `rotate(${position.angle}deg) skewX(${(Math.atan(previewShear?.axis === 'x' ? previewShear.value : (shearX ?? 0)) * 180) / Math.PI}deg) skewY(${(Math.atan(previewShear?.axis === 'y' ? previewShear.value : (shearY ?? 0)) * 180) / Math.PI}deg)`,
         transformOrigin: '50% 50%',
       }}
     >
@@ -169,6 +256,28 @@ export function SelectionControls({
         </div>
       ))}
 
+      {onShearEnd && (
+        <div
+          data-canvas-control
+          data-shear-handle
+          aria-label='Cisalhar texto horizontalmente'
+          className='pointer-events-auto absolute top-0 left-1/2 h-2 -translate-x-1/2 -translate-y-1/2 cursor-ew-resize touch-none border-t-2 border-[var(--canvas-selection)]'
+          style={{ width: 'max(14px, calc(100% - 28px))' }}
+          onPointerDown={startShear('x')}
+          {...pointerEvents}
+        />
+      )}
+      {onShearEnd && (
+        <div
+          data-canvas-control
+          data-shear-y-handle
+          aria-label='Cisalhar texto verticalmente'
+          className='pointer-events-auto absolute top-1/2 left-0 w-2 -translate-x-1/2 -translate-y-1/2 cursor-ns-resize touch-none border-l-2 border-[var(--canvas-selection)]'
+          style={{ height: 'max(14px, calc(100% - 28px))' }}
+          onPointerDown={startShear('y')}
+          {...pointerEvents}
+        />
+      )}
       <span className='pointer-events-none absolute top-0 left-1/2 h-2 w-px -translate-x-1/2 -translate-y-full bg-[var(--canvas-selection)]' />
       <div
         data-canvas-control

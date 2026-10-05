@@ -5,7 +5,7 @@ use image::DynamicImage;
 use koharu_llama::mtmd::mtmd_default_marker;
 
 use crate::{
-    Device,
+    Backend, Device,
     llm::{ChatMessage, GenerationOptions, Input, Llm, LoadOptions, MtmdOptions},
     paddle_ocr_vl::{MAX_NEW_TOKENS, PaddleOCRVLResult, PaddleOCRVLTask, REPETITION_PENALTY},
 };
@@ -25,16 +25,29 @@ impl PaddleOCRVLQuantized {
         let (model_path, projector_path) =
             tokio::try_join!(MODEL.resolve(), PROJECTOR.resolve())
                 .context("failed to resolve quantized PaddleOCR-VL-1.6 files")?;
-        let model = Llm::load_with_options(
-            device,
-            model_path,
-            LoadOptions {
-                mtmd: Some(MtmdOptions::new(projector_path)),
-                ..LoadOptions::default()
-            },
-        )
-        .await
-        .context("failed to load quantized PaddleOCR-VL-1.6")?;
+        let model = match load_model(device.clone(), model_path.clone(), projector_path.clone())
+            .await
+        {
+            Ok(model) => model,
+            Err(device_error) if device.backend != Backend::Cpu => {
+                tracing::warn!(
+                    device = %device.name,
+                    error = ?device_error,
+                    "PaddleOCR-VL could not load on the selected device; retrying on CPU"
+                );
+                load_model(Device::cpu(), model_path, projector_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "failed to load quantized PaddleOCR-VL-1.6 on CPU after {} failed: {device_error:#}",
+                            device.name
+                        )
+                    })?
+            }
+            Err(error) => {
+                return Err(error).context("failed to load quantized PaddleOCR-VL-1.6");
+            }
+        };
         ensure!(
             model.capabilities().vision,
             "PaddleOCR-VL-1.6 projector does not support images"
@@ -67,4 +80,21 @@ impl PaddleOCRVLQuantized {
             text: generation.text,
         })
     }
+}
+
+async fn load_model(
+    device: Device,
+    model_path: std::path::PathBuf,
+    projector_path: std::path::PathBuf,
+) -> Result<Llm> {
+    Llm::load_with_options(
+        device,
+        model_path,
+        LoadOptions {
+            mtmd: Some(MtmdOptions::new(projector_path)),
+            ..LoadOptions::default()
+        },
+    )
+    .await
+    .context("failed to load PaddleOCR-VL GGUF and projector")
 }

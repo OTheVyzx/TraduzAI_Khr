@@ -1,8 +1,16 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context as _, Result};
 use koharu_pipeline::{Committer, Progress, RunStatus, StageOutput, StopToken};
-use koharu_scene::Snapshot;
+use koharu_scene::{EntityId, Snapshot};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use specta::Type;
@@ -12,6 +20,8 @@ use uuid::Uuid;
 
 use super::{ChannelExt as _, Error, canvas::CanvasChannel, project::CurrentProject};
 use koharu_desktop::Desktop;
+
+mod timing;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Type)]
 #[serde(transparent)]
@@ -63,7 +73,6 @@ pub enum JobState {
 pub(crate) struct Processing {
     pub(crate) stops: Mutex<HashMap<JobId, StopToken>>,
     pub(crate) jobs: Mutex<HashMap<JobId, Job>>,
-    pub(crate) inpainting_mask: Mutex<Option<koharu_pipeline::InpaintingMask>>,
 }
 
 #[derive(Default)]
@@ -89,6 +98,64 @@ pub(crate) async fn process(
         .as_ref()
         .context("no project is open")?
         .snapshot();
+    start_processing(
+        handle,
+        snapshot,
+        scope,
+        operation,
+        None,
+        processing.inner(),
+        job_channel.inner(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn process_with_inpainting_mask(
+    handle: AppHandle<CefRuntime>,
+    page: EntityId,
+    expected_size: [u32; 2],
+    scope: koharu_pipeline::Scope,
+    operation: koharu_pipeline::Operation,
+    inpainting_mask: koharu_pipeline::InpaintingMask,
+    project: &CurrentProject,
+    processing: &Processing,
+    job_channel: &JobChannel,
+) -> std::result::Result<JobId, Error> {
+    let snapshot = project
+        .project
+        .lock()
+        .await
+        .as_ref()
+        .context("no project is open")?
+        .snapshot();
+    let size = snapshot.page(page)?.page()?;
+    if [size.width.round() as u32, size.height.round() as u32] != expected_size {
+        return Err(anyhow::anyhow!(
+            "page dimensions changed while the canvas edit was in progress"
+        )
+        .into());
+    }
+    start_processing(
+        handle,
+        snapshot,
+        scope,
+        operation,
+        Some(inpainting_mask),
+        processing,
+        job_channel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_processing(
+    handle: AppHandle<CefRuntime>,
+    snapshot: Snapshot,
+    scope: koharu_pipeline::Scope,
+    operation: koharu_pipeline::Operation,
+    inpainting_mask: Option<koharu_pipeline::InpaintingMask>,
+    processing: &Processing,
+    job_channel: &JobChannel,
+) -> std::result::Result<JobId, Error> {
     let id = JobId::new();
     let stop = StopToken::default();
     {
@@ -113,9 +180,19 @@ pub(crate) async fn process(
 
     let pipeline = handle.state::<koharu_pipeline::Pipeline>().inner().clone();
     let task_handle = handle.clone();
-    let inpainting_mask = processing.inpainting_mask.lock().take();
+    let pipeline_started = Instant::now();
+    let started_at_unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let logged_operation = operation.clone();
+    let page_count = Arc::new(AtomicUsize::new(0));
+    let stage_count = Arc::new(AtomicUsize::new(0));
     drop(tokio::spawn(async move {
         let progress = Arc::new(Mutex::new((0_usize, 0_usize)));
+        let page_count_handle = page_count.clone();
+        let stage_count_handle = stage_count.clone();
+        let progress_state = progress.clone();
         let progress_handle = task_handle.clone();
         let mut request = koharu_pipeline::Request {
             operation,
@@ -127,24 +204,39 @@ pub(crate) async fn process(
         request.progress = Some(Arc::new(move |event| {
             let update = match event {
                 Progress::Started { pages, stages } => {
+                    page_count_handle.store(pages.len(), Ordering::Relaxed);
+                    stage_count_handle.store(stages.len(), Ordering::Relaxed);
+                    tracing::info!(
+                        job = %id,
+                        page_count = pages.len(),
+                        stage_count = stages.len(),
+                        "pipeline timing started",
+                    );
                     tracing::info!(
                         target: "koharu_metrics",
                         metric = "pipeline_start",
                         page_count = pages.len(),
                         stage_count = stages.len(),
                     );
-                    let mut progress = progress.lock();
+                    let mut progress = progress_state.lock();
                     *progress = (0, pages.len().saturating_mul(stages.len()));
                     Some((0, progress.1, None, None, None))
                 }
                 Progress::Loading { page, stage, model } => {
+                    tracing::info!(
+                        job = %id,
+                        %page,
+                        %stage,
+                        %model,
+                        "pipeline stage loading",
+                    );
                     tracing::info!(
                         target: "koharu_metrics",
                         metric = "stage_loading",
                         stage = %stage,
                         model,
                     );
-                    let progress = progress.lock();
+                    let progress = progress_state.lock();
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Finished {
@@ -153,6 +245,14 @@ pub(crate) async fn process(
                     model,
                     elapsed,
                 } => {
+                    tracing::info!(
+                        job = %id,
+                        %page,
+                        %stage,
+                        %model,
+                        duration_ms = elapsed.as_secs_f64() * 1000.0,
+                        "pipeline stage finished",
+                    );
                     if stage != koharu_pipeline::Stage::Translation {
                         tracing::info!(
                             target: "koharu_metrics",
@@ -162,21 +262,34 @@ pub(crate) async fn process(
                             duration_ms = elapsed.as_secs_f64() * 1000.0,
                         );
                     }
-                    let mut progress = progress.lock();
+                    let mut progress = progress_state.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Skipped { page, stage } => {
                     tracing::info!(
+                        job = %id,
+                        %page,
+                        %stage,
+                        "pipeline stage skipped",
+                    );
+                    tracing::info!(
                         target: "koharu_metrics",
                         metric = "stage_skip",
                         stage = %stage,
                     );
-                    let mut progress = progress.lock();
+                    let mut progress = progress_state.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), None))
                 }
-                Progress::Running { stage, model, .. } => {
+                Progress::Running { page, stage, model } => {
+                    tracing::info!(
+                        job = %id,
+                        %page,
+                        %stage,
+                        %model,
+                        "pipeline stage started",
+                    );
                     tracing::info!(
                         target: "koharu_metrics",
                         metric = "stage_running",
@@ -236,23 +349,78 @@ pub(crate) async fn process(
             handle: task_handle.clone(),
         };
         let result = pipeline.execute(snapshot, request, &mut committer).await;
-        let (stopped, error) = match result {
-            Ok(report) => (report.status == RunStatus::Stopped, None),
+        let (stopped, error, pipeline_duration_ms, outcome) = match result {
+            Ok(report) => {
+                let stopped = report.status == RunStatus::Stopped;
+                let outcome = if stopped { "stopped" } else { "completed" };
+                tracing::info!(
+                    job = %id,
+                    outcome,
+                    duration_ms = report.elapsed.as_secs_f64() * 1000.0,
+                    wall_duration_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0,
+                    "pipeline timing finished",
+                );
+                (stopped, None, Some(report.elapsed.as_millis()), outcome)
+            }
             Err(error) => {
-                tracing::error!(stage = ?error.stage, %error, "processing failed");
-                (false, Some(format!("{error:#}")))
+                let error_message = format!("{error:#}");
+                tracing::error!(stage = ?error.stage, error = %error_message, "processing failed");
+                tracing::info!(
+                    job = %id,
+                    outcome = "failed",
+                    duration_ms = pipeline_started.elapsed().as_secs_f64() * 1000.0,
+                    "pipeline timing finished",
+                );
+                (false, Some(error_message), None, "failed")
             }
         };
+        let wall_duration = pipeline_started.elapsed();
+        let finished_at_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let (completed_steps, total_steps) = *progress.lock();
+        let timing_record = timing::PipelineTimingRecord {
+            job_id: id.to_string(),
+            operation: logged_operation,
+            outcome: outcome.to_owned(),
+            started_at_unix_ms,
+            finished_at_unix_ms,
+            wall_duration_ms: wall_duration.as_millis(),
+            pipeline_duration_ms,
+            page_count: page_count.load(Ordering::Relaxed),
+            stage_count: stage_count.load(Ordering::Relaxed),
+            completed_steps,
+            total_steps,
+            error: error.clone(),
+        };
+        let timing_path = koharu_config::path().and_then(|config_path| {
+            config_path
+                .parent()
+                .map(|directory| directory.join("logs").join("pipeline-timings.jsonl"))
+                .context("Koharu configuration path has no parent directory")
+        });
+        match timing_path {
+            Ok(path) => {
+                match tokio::task::spawn_blocking(move || {
+                    timing::append_record(&path, &timing_record)
+                })
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "failed to write pipeline timing log")
+                    }
+                    Err(error) => tracing::error!(%error, "pipeline timing log task failed"),
+                }
+            }
+            Err(error) => tracing::error!(%error, "failed to resolve pipeline timing log path"),
+        }
         tracing::info!(
             target: "koharu_metrics",
             metric = "pipeline_result",
-            outcome = if stopped {
-                "stopped"
-            } else if error.is_some() {
-                "failed"
-            } else {
-                "completed"
-            },
+            outcome,
+            duration_ms = wall_duration.as_secs_f64() * 1000.0,
         );
         task_handle.state::<Processing>().stops.lock().remove(&id);
         let job = task_handle

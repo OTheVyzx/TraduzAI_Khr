@@ -1078,6 +1078,24 @@ async fn independent_pipeline_components_rebase() {
                     stroke_width: None,
                     alignment: Some(TextAlignment::Center),
                     writing_mode: None,
+                    placement: Some(TextPlacement::OriginalText),
+                    shear_x: Some(0.2),
+                    shear_y: Some(-0.15),
+                    shadow: Some(TextShadow {
+                        color: [0, 0, 0, 128],
+                        offset_x: 2.0,
+                        offset_y: 3.0,
+                        blur_radius: 4.0,
+                    }),
+                    glow: Some(TextGlow {
+                        color: [255, 255, 255, 96],
+                        radius: 5.0,
+                    }),
+                    gradient: Some(TextGradient {
+                        start_color: [255, 0, 0, 255],
+                        end_color: [0, 0, 255, 255],
+                        angle_degrees: 90.0,
+                    }),
                     extensions: BTreeMap::new(),
                 },
             )
@@ -1092,7 +1110,13 @@ async fn independent_pipeline_components_rebase() {
             .unwrap()
             .is_some()
     );
-    assert!(snapshot.component::<Typography>(layer).unwrap().is_some());
+    let saved = snapshot.component::<Typography>(layer).unwrap().unwrap();
+    assert_eq!(saved.placement, Some(TextPlacement::OriginalText));
+    assert_eq!(saved.shear_x, Some(0.2));
+    assert_eq!(saved.shear_y, Some(-0.15));
+    assert_eq!(saved.shadow.unwrap().blur_radius, 4.0);
+    assert_eq!(saved.glow.unwrap().radius, 5.0);
+    assert_eq!(saved.gradient.unwrap().angle_degrees, 90.0);
 }
 
 #[tokio::test]

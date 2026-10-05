@@ -136,6 +136,8 @@
     "providerDefault": "Sağlayıcı varsayılanı",
     "run": "Çalıştır",
     "runProcessing": "İşlemeyi çalıştır",
+    "translateMissing": "Çevrilmemişleri çevir: {{count}}",
+    "fillMissing": "Eksikleri doldur: {{count}}",
     "scope": "Kapsam",
     "scopeShort": {
       "page": "Sayfa",
@@ -390,6 +392,12 @@
         "textThreshold": "Metin eşiği"
       },
       "processing": "İşleniyor",
+      "parallelism": "Paralellik",
+      "workers": {
+        "description": "Geçerli aşamada etkin sayfa sayısını sınırlar. VRAM kullanımını denetlemek için GPU çıkarımı sıralı yürütülür.",
+        "label": "Etkin sayfalar",
+        "title": "Sayfa çalışanları"
+      },
       "stages": {
         "detection": {
           "description": "Metinleri, konuşma balonlarını ve panelleri bulur.",
@@ -503,9 +511,13 @@
     "draw": "Çizim",
     "eraser": "Silgi",
     "increaseBrushSize": "Fırça boyutunu artır",
+    "inpaint_region": "Çokgen içinde içerik doldur",
+    "ocr_region": "Alandaki metni tanı",
     "pan": "Kaydır",
     "remove": "Kaldır",
+    "restore_region": "Alandaki özgün görüntüyü geri yükle",
     "select": "Seç",
+    "snap_to_center": "Metni görüntünün merkezine yasla",
     "text": "Metin"
   },
   "updater": {

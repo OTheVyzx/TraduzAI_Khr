@@ -136,6 +136,8 @@
     "providerDefault": "提供商默认值",
     "run": "运行",
     "runProcessing": "运行处理",
+    "translateMissing": "翻译未翻译文本：{{count}}",
+    "fillMissing": "填充待处理项：{{count}}",
     "scope": "范围",
     "scopeShort": {
       "page": "页面",
@@ -390,6 +392,12 @@
         "textThreshold": "文本阈值"
       },
       "processing": "正在处理",
+      "parallelism": "并行处理",
+      "workers": {
+        "description": "限制当前阶段同时处理的页面数。为控制显存使用，GPU 模型推理仍按顺序执行。",
+        "label": "活动页面",
+        "title": "页面工作线程"
+      },
       "stages": {
         "detection": {
           "description": "查找文本、气泡和分镜。",
@@ -503,9 +511,13 @@
     "draw": "绘画",
     "eraser": "橡皮擦",
     "increaseBrushSize": "增大画笔大小",
+    "inpaint_region": "修复多边形区域",
+    "ocr_region": "识别区域中的文字",
     "pan": "平移",
     "remove": "移除",
+    "restore_region": "恢复区域中的原始图像",
     "select": "选择",
+    "snap_to_center": "将文本吸附到图像中心",
     "text": "文本"
   },
   "updater": {

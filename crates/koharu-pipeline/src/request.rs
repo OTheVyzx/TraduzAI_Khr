@@ -42,12 +42,10 @@ impl Operation {
             Self::Through { stage: Stage::Ocr } => vec![Stage::Detection, Stage::Ocr],
             Self::Through {
                 stage: Stage::Translation,
-            } => {
-                vec![Stage::Detection, Stage::Ocr, Stage::Translation]
-            }
+            } => Stage::ALL.to_vec(),
             Self::Through {
                 stage: Stage::Inpainting,
-            } => vec![Stage::Detection, Stage::Inpainting],
+            } => vec![Stage::Detection, Stage::Ocr, Stage::Inpainting],
             Self::Only { stage } => vec![*stage],
             Self::Stages { stages } => Stage::ALL
                 .into_iter()

@@ -7,6 +7,7 @@ use crate::stages::{Flux2KleinConfig, KoharuLayoutRFDetrSeg2XLConfig, RoremMixed
 
 #[derive(Clone, Debug, PartialEq, Type)]
 pub struct PipelineConfig {
+    pub page_workers: u8,
     pub detection: DetectionModel,
     pub ocr: OcrModel,
     pub translation: TranslationConfig,
@@ -19,6 +20,7 @@ pub struct PipelineConfig {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 struct PipelineFile {
+    page_workers: u8,
     detection: ModelSelection,
     ocr: ModelSelection,
     translation: TranslationConfig,
@@ -30,6 +32,7 @@ struct PipelineFile {
 impl Default for PipelineFile {
     fn default() -> Self {
         Self {
+            page_workers: DEFAULT_PAGE_WORKERS,
             detection: ModelSelection {
                 model: "koharu-layout-rfdetr-seg-2xl".to_owned(),
             },
@@ -86,6 +89,7 @@ impl Serialize for PipelineConfig {
             InpaintingModel::LaMa {} | InpaintingModel::AotInpainting {} => {}
         }
         PipelineFile {
+            page_workers: self.page_workers,
             detection: ModelSelection {
                 model: detection.to_owned(),
             },
@@ -148,6 +152,7 @@ impl<'de> Deserialize<'de> for PipelineConfig {
             }
         };
         Ok(Self {
+            page_workers: file.page_workers.clamp(MIN_PAGE_WORKERS, MAX_PAGE_WORKERS),
             detection,
             ocr,
             translation: file.translation,
@@ -160,6 +165,7 @@ impl<'de> Deserialize<'de> for PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
+            page_workers: DEFAULT_PAGE_WORKERS,
             detection: DetectionModel::KoharuLayoutRFDetrSeg2XL(
                 KoharuLayoutRFDetrSeg2XLConfig::default(),
             ),
@@ -170,6 +176,10 @@ impl Default for PipelineConfig {
         }
     }
 }
+
+pub const DEFAULT_PAGE_WORKERS: u8 = 4;
+pub const MIN_PAGE_WORKERS: u8 = 1;
+pub const MAX_PAGE_WORKERS: u8 = 16;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct TranslationConfig {
@@ -296,6 +306,7 @@ mod tests {
     fn defaults_select_one_processor_for_each_phase() {
         let config = PipelineConfig::default();
 
+        assert_eq!(config.page_workers, DEFAULT_PAGE_WORKERS);
         assert!(matches!(
             config.detection,
             DetectionModel::KoharuLayoutRFDetrSeg2XL(_)
@@ -342,6 +353,17 @@ mod tests {
         let config = toml::from_str::<PipelineConfig>("").unwrap();
 
         assert_eq!(config, PipelineConfig::default());
+    }
+
+    #[test]
+    fn page_worker_count_round_trips_through_pipeline_config() {
+        let config: PipelineConfig = toml::from_str("page_workers = 6").unwrap();
+        assert_eq!(config.page_workers, 6);
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("page_workers = 6"));
+        let restored = toml::from_str::<PipelineConfig>(&serialized).unwrap();
+        assert_eq!(restored.page_workers, config.page_workers);
     }
 
     #[test]
@@ -431,6 +453,7 @@ mod tests {
     #[test]
     fn serializes_model_profiles_under_processor() {
         let config = PipelineConfig {
+            page_workers: 3,
             detection: DetectionModel::KoharuLayoutRFDetrSeg2XL(KoharuLayoutRFDetrSeg2XLConfig {
                 text_threshold: Some(0.25),
                 ..Default::default()

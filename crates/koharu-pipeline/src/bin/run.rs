@@ -48,6 +48,9 @@ struct Arguments {
 
     #[arg(long)]
     cpu: bool,
+
+    #[arg(long, default_value_t = koharu_pipeline::DEFAULT_PAGE_WORKERS)]
+    page_workers: u8,
 }
 
 struct SessionCommitter<'a>(&'a mut Session);
@@ -92,6 +95,7 @@ enum InpaintingChoice {
 impl Arguments {
     fn pipeline_config(&self) -> PipelineConfig {
         PipelineConfig {
+            page_workers: self.page_workers,
             detection: match self.detection {
                 DetectionChoice::KoharuLayoutRFDetrSeg2XL => {
                     DetectionModel::KoharuLayoutRFDetrSeg2XL(

@@ -9,12 +9,13 @@ mod config;
 mod model;
 mod processor;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use image::DynamicImage;
 use koharu_torch::Device;
 
 use crate::backend::TryIntoDevice;
 
+use self::processor::{map_detection_to_page, pad_tile, plan_tiles};
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
     processor::{
@@ -71,10 +72,34 @@ impl KoharuLayoutRFDetrSeg2XL {
         thresholds: KoharuLayoutThresholds,
     ) -> Result<KoharuLayoutDetections> {
         koharu_torch::no_grad(|| {
-            let pixel_values = self.processor.preprocess(image, self.device)?;
-            let output = self.model.forward(&pixel_values);
-            self.processor
-                .postprocess(&output, image.width(), image.height(), thresholds)
+            let width = image.width();
+            let height = image.height();
+            ensure!(width > 0 && height > 0, "cannot segment an empty image");
+            let resolution = self.processor.resolution();
+            let source = image.to_rgb8();
+            let mut detections = Vec::<KoharuLayoutDetection>::new();
+
+            // The checkpoint requires square inputs. Analyze overlapping native-scale
+            // tiles so tall pages do not lose small lettering when squeezed into one square.
+            for tile in plan_tiles(width, height, resolution) {
+                let tile_image = DynamicImage::ImageRgb8(pad_tile(&source, tile, resolution));
+                let pixel_values = self.processor.preprocess(&tile_image, self.device)?;
+                let output = self.model.forward(&pixel_values);
+                let mut tile_result = self
+                    .processor
+                    .postprocess(&output, resolution, resolution, thresholds)?;
+                detections.extend(
+                    tile_result.detections.drain(..).filter_map(|detection| {
+                        map_detection_to_page(detection, tile, width, height)
+                    }),
+                );
+            }
+
+            Ok(KoharuLayoutDetections {
+                image_width: width,
+                image_height: height,
+                detections,
+            })
         })
     }
 

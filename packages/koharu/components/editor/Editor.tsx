@@ -16,7 +16,12 @@ export function Editor() {
     <ColorSamplingProvider>
       <div className='relative min-h-0 flex-1 bg-transparent'>
         <ActivityCenter />
-        <ResizablePanelGroup id='editor' orientation='horizontal' className='h-full min-h-0'>
+        <ResizablePanelGroup
+          id='editor'
+          orientation='horizontal'
+          defaultLayout={{ pages: 18, canvas: 58, inspector: 24 }}
+          className='h-full min-h-0'
+        >
           <ResizablePanel
             id='pages'
             defaultSize='18%'
@@ -28,7 +33,11 @@ export function Editor() {
           >
             <PageRail />
           </ResizablePanel>
-          <ResizableHandle className='w-0 bg-transparent' />
+          <ResizableHandle
+            withHandle
+            aria-label='Redimensionar lista de páginas e tela'
+            className='z-20 w-1 bg-border/40 transition-colors hover:bg-primary/70 focus-visible:bg-primary'
+          />
           <ResizablePanel
             id='canvas'
             defaultSize='58%'
@@ -37,7 +46,11 @@ export function Editor() {
           >
             <CanvasWorkspace />
           </ResizablePanel>
-          <ResizableHandle className='w-0 bg-transparent' />
+          <ResizableHandle
+            withHandle
+            aria-label='Redimensionar tela e inspetor'
+            className='z-20 w-1 bg-border/40 transition-colors hover:bg-primary/70 focus-visible:bg-primary'
+          />
           <ResizablePanel
             id='inspector'
             defaultSize='24%'

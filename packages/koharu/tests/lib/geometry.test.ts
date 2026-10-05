@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { resizeFrame, rotateFrame } from '@/lib/geometry'
+import { resizeFontScale, resizeFrame, rotateFrame } from '@/lib/geometry'
 import type { Frame } from '@koharu/bridge/protocol'
 
 const frame: Frame = { x: 10, y: 20, width: 100, height: 50, angle_degrees: 0 }
@@ -33,5 +33,13 @@ describe('selection control geometry', () => {
       ...frame,
       angle_degrees: 90,
     })
+  })
+
+  it('scales type smoothly with the dimensions changed by the dragged handle', () => {
+    expect(resizeFontScale(frame, { ...frame, width: 150 }, 'e')).toBeCloseTo(1.5)
+    expect(resizeFontScale(frame, { ...frame, height: 75 }, 's')).toBeCloseTo(1.5)
+    expect(resizeFontScale(frame, { ...frame, width: 150, height: 100 }, 'se')).toBeCloseTo(
+      Math.sqrt(3),
+    )
   })
 })

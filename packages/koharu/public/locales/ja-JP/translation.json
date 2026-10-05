@@ -136,6 +136,8 @@
     "providerDefault": "プロバイダーの既定値",
     "run": "実行",
     "runProcessing": "処理を実行",
+    "translateMissing": "未翻訳を翻訳: {{count}}",
+    "fillMissing": "未処理を塗りつぶす: {{count}}",
     "scope": "範囲",
     "scopeShort": {
       "page": "ページ",
@@ -390,6 +392,12 @@
         "textThreshold": "テキストしきい値"
       },
       "processing": "処理中",
+      "parallelism": "並列処理",
+      "workers": {
+        "description": "現在の段階で同時に処理するページ数を制限します。VRAM使用量を抑えるため、GPU推論は直列で実行します。",
+        "label": "処理中のページ数",
+        "title": "ページワーカー数"
+      },
       "stages": {
         "detection": {
           "description": "テキスト、吹き出し、コマを検出します。",
@@ -503,9 +511,13 @@
     "draw": "描画",
     "eraser": "消しゴム",
     "increaseBrushSize": "ブラシサイズを拡大",
+    "inpaint_region": "ポリゴン内をインペイント",
+    "ocr_region": "範囲内の文字を認識",
     "pan": "移動",
     "remove": "削除",
+    "restore_region": "範囲内の元画像を復元",
     "select": "選択",
+    "snap_to_center": "テキストを画像の中央にスナップ",
     "text": "テキスト"
   },
   "updater": {

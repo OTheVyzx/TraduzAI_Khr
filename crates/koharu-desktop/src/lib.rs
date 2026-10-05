@@ -44,6 +44,7 @@ pub struct CanvasState {
     pub generation: u64,
     pub size: [u32; 2],
     pub element_frames: Vec<TransformFrame>,
+    pub element_font_sizes: Vec<(EntityId, f32)>,
 }
 
 #[derive(Default)]
@@ -185,6 +186,28 @@ impl Desktop {
             .with_context(|| format!("canvas page {page} at revision {revision} is not prepared"))
     }
 
+    pub fn canvas_frame_for_edit(
+        &self,
+        page: EntityId,
+        expected_revision: Revision,
+    ) -> Result<RenderedFrame> {
+        if let Ok(frame) = self.page_frame(page, expected_revision) {
+            return Ok(frame);
+        }
+
+        let presentation = self.presentation.read();
+        let frame = presentation
+            .frame
+            .as_ref()
+            .context("there is no prepared canvas frame")?;
+        if !supports_canvas_edit_frame(frame.page(), frame.revision(), page, expected_revision) {
+            bail!(
+                "canvas page {page} at revision {expected_revision} is no longer available for editing"
+            );
+        }
+        Ok(frame.clone())
+    }
+
     #[must_use]
     pub fn canvas_state(&self) -> CanvasState {
         let presentation = self.presentation.read();
@@ -195,6 +218,7 @@ impl Desktop {
                 generation: presentation.generation,
                 size: [0, 0],
                 element_frames: Vec::new(),
+                element_font_sizes: Vec::new(),
             };
         };
         let (width, height) = frame.size();
@@ -220,31 +244,29 @@ impl Desktop {
                 })
             })
             .collect();
+        let element_font_sizes = frame
+            .layers()
+            .iter()
+            .filter_map(|layer| match layer.kind() {
+                LayerKind::Text(text) => Some((layer.entity(), text.font_size)),
+                LayerKind::Image(_) => None,
+            })
+            .collect();
         CanvasState {
             page: Some(frame.page()),
             revision: Some(frame.revision()),
             generation: presentation.generation,
             size: [width, height],
             element_frames,
+            element_font_sizes,
         }
     }
 
     pub fn transform_geometries(
         &self,
-        expected_revision: Revision,
+        rendered: &RenderedFrame,
         elements: &[TransformFrame],
     ) -> Result<Vec<(EntityId, Geometry, f32)>> {
-        let presentation = self.presentation.read();
-        let rendered = presentation
-            .frame
-            .as_ref()
-            .context("there is no prepared canvas frame")?;
-        if rendered.revision() != expected_revision {
-            bail!(
-                "canvas transform expected revision {expected_revision}, but the prepared frame is at {}",
-                rendered.revision()
-            );
-        }
         let mut seen = HashSet::with_capacity(elements.len());
         let mut geometries = Vec::with_capacity(elements.len());
         for element in elements {
@@ -463,6 +485,15 @@ impl Desktop {
     }
 }
 
+fn supports_canvas_edit_frame(
+    frame_page: EntityId,
+    frame_revision: Revision,
+    requested_page: EntityId,
+    expected_revision: Revision,
+) -> bool {
+    frame_page == requested_page && frame_revision >= expected_revision
+}
+
 impl PageFrameCache {
     fn get(&mut self, page: EntityId, revision: Revision) -> Option<RenderedFrame> {
         self.clock = self.clock.wrapping_add(1);
@@ -544,9 +575,36 @@ fn transform_point([a, b, c, d, e, f]: [f64; 6], point: &Point) -> Point {
 mod tests {
     use std::{future::pending, sync::Arc, time::Duration};
 
+    use koharu_scene::{EntityId, Revision};
     use tokio::{sync::Notify, time::timeout};
 
-    use super::Desktop;
+    use super::{Desktop, supports_canvas_edit_frame};
+
+    #[test]
+    fn canvas_edits_accept_newer_frames_for_the_same_page() {
+        let page = EntityId::new();
+        let expected = Revision::ZERO;
+        let rendered = expected.next().unwrap();
+
+        assert!(supports_canvas_edit_frame(page, rendered, page, expected));
+    }
+
+    #[test]
+    fn canvas_edits_reject_frames_from_another_page_or_older_revision() {
+        let page = EntityId::new();
+        let other_page = EntityId::new();
+        let expected = Revision::ZERO.next().unwrap();
+
+        assert!(!supports_canvas_edit_frame(
+            other_page, expected, page, expected
+        ));
+        assert!(!supports_canvas_edit_frame(
+            page,
+            Revision::ZERO,
+            page,
+            expected
+        ));
+    }
 
     #[tokio::test]
     async fn newer_request_preempts_current_preparation_and_acquires_ownership() {

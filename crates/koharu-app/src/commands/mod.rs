@@ -102,10 +102,14 @@ pub fn bindings() -> tauri_specta::Builder<tauri_runtime_cef::CefRuntime> {
             canvas::get_canvas_page_resource,
             canvas::add_point_text,
             canvas::add_text_box,
+            canvas::rasterize_text,
+            canvas::recognize_selected_region,
+            canvas::restore_original_region,
             canvas::commit_paint,
             canvas::commit_erase,
             canvas::commit_transform,
             canvas::commit_inpaint,
+            canvas::commit_inpaint_region,
         ])
         .disable_serde_phases()
         .error_handling(ErrorHandlingMode::Throw)

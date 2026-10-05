@@ -17,6 +17,7 @@ use crate::{
 pub(crate) struct StageRunner {
     stages: Stages,
     accelerator: AcceleratorGate,
+    page_workers: usize,
 }
 
 impl StageRunner {
@@ -29,7 +30,15 @@ impl StageRunner {
         Ok(Self {
             stages: Stages::new(config, translator, device)?,
             accelerator: AcceleratorGate::new(device, resources),
+            page_workers: config.page_workers.clamp(
+                crate::config::MIN_PAGE_WORKERS,
+                crate::config::MAX_PAGE_WORKERS,
+            ) as usize,
         })
+    }
+
+    pub(crate) fn page_workers(&self) -> usize {
+        self.page_workers
     }
 
     #[tracing::instrument(skip_all)]

@@ -4,7 +4,10 @@ use super::{StageInput, StageProcessor, finish, generation};
 use crate::{ModelCell, OcrModel, scope::geometry_extents};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView as _, GrayImage, Luma, Rgba, RgbaImage};
+use imageproc::drawing::draw_polygon_mut;
+use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
+use imageproc::point::Point as ImagePoint;
 use koharu_ml::{
     baberu_ocr::BaberuOcr, hayai_ocr::HayaiOcr, manga_ocr::MangaOcr,
     paddle_ocr_vl::PaddleOCRVLTask, paddle_ocr_vl_quantized::PaddleOCRVLQuantized,
@@ -108,19 +111,22 @@ impl Model {
             if !input.contains_entity(region)? {
                 continue;
             }
-            let is_text_region = input
-                .scene
-                .component::<Region>(region)?
-                .is_some_and(|value| value.kind == TextRegion::kind());
-            if !is_text_region {
+            let Some(region_data) = input.scene.component::<Region>(region)? else {
+                continue;
+            };
+            if region_data.kind != TextRegion::kind() {
                 continue;
             }
             let geometry = input
                 .scene
                 .component::<Geometry>(region)?
                 .ok_or_else(|| anyhow!("text region {region} has no geometry"))?;
-            let crop = crop(&source, &geometry)
-                .with_context(|| format!("text region {region} is outside its source image"))?;
+            let crop = crop(
+                &source,
+                &geometry,
+                matches!(region_data.origin, Origin::User),
+            )
+            .with_context(|| format!("text region {region} is outside its source image"))?;
             for relation in input.scene.relations_to_as::<RecognizedFrom>(region) {
                 let content = relation.value().source;
                 let previous = input.scene.component::<SourceText>(content)?;
@@ -187,17 +193,11 @@ impl Model {
                     language,
                 },
             )?;
-            let (min_x, min_y, max_x, max_y) = geometry_extents(&result.geometry)
-                .ok_or_else(|| anyhow!("text region {} has empty geometry", result.region))?;
             edit.set(
                 result.region,
                 &OcrAnalysis {
                     origin: Origin::Generated(generation.clone()),
-                    direction: if max_y - min_y >= (max_x - min_x) * 1.15 {
-                        TextDirection::Vertical
-                    } else {
-                        TextDirection::Horizontal
-                    },
+                    direction: text_direction(&result.geometry)?,
                     confidence: None,
                     line_boundaries: Vec::new(),
                 },
@@ -266,22 +266,189 @@ fn normalize_ocr_text(text: String) -> String {
     }
 }
 
-fn crop(source: &DynamicImage, geometry: &Geometry) -> Result<DynamicImage> {
+fn text_direction(geometry: &Geometry) -> Result<TextDirection> {
+    let (width, height) = if geometry.points.len() == 4 && convex_quad(&geometry.points) {
+        let points = &geometry.points;
+        let edge =
+            |a: usize, b: usize| (points[a].x - points[b].x).hypot(points[a].y - points[b].y);
+        (edge(0, 1).max(edge(2, 3)), edge(1, 2).max(edge(3, 0)))
+    } else {
+        let (min_x, min_y, max_x, max_y) =
+            geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
+        (max_x - min_x, max_y - min_y)
+    };
+    Ok(if height >= width * 1.15 {
+        TextDirection::Vertical
+    } else {
+        TextDirection::Horizontal
+    })
+}
+
+fn crop(source: &DynamicImage, geometry: &Geometry, isolate_polygon: bool) -> Result<DynamicImage> {
     let (min_x, min_y, max_x, max_y) =
         geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
-    let x = min_x.floor().max(0.0) as u32;
-    let y = min_y.floor().max(0.0) as u32;
-    let right = max_x.ceil().max(0.0).min(f64::from(source.width())) as u32;
-    let bottom = max_y.ceil().max(0.0).min(f64::from(source.height())) as u32;
+    let isolated = isolate_polygon.then(|| isolate_polygon_pixels(source, geometry));
+    let source = isolated.as_ref().unwrap_or(source);
+    if geometry.points.len() == 4 && convex_quad(&geometry.points) {
+        let points = &geometry.points;
+        let edge =
+            |a: usize, b: usize| (points[a].x - points[b].x).hypot(points[a].y - points[b].y);
+        let width = edge(0, 1).max(edge(2, 3));
+        let height = edge(1, 2).max(edge(3, 0));
+        if width.is_finite() && height.is_finite() && width >= 1.0 && height >= 1.0 {
+            let margin = (width.min(height) * 0.08).clamp(2.0, 12.0);
+            let output_width = (width + margin * 2.0).ceil() as u32;
+            let output_height = (height + margin * 2.0).ceil() as u32;
+            // Malformed model geometry must never allocate an unbounded OCR image.
+            if output_width <= source.width().saturating_mul(2)
+                && output_height <= source.height().saturating_mul(2)
+            {
+                let from =
+                    std::array::from_fn(|index| (points[index].x as f32, points[index].y as f32));
+                let margin = margin as f32;
+                let to = [
+                    (margin, margin),
+                    (margin + width as f32, margin),
+                    (margin + width as f32, margin + height as f32),
+                    (margin, margin + height as f32),
+                ];
+                if let Some(projection) = Projection::from_control_points(from, to) {
+                    let mut output = RgbaImage::from_pixel(
+                        output_width,
+                        output_height,
+                        Rgba([255, 255, 255, 255]),
+                    );
+                    warp_into(
+                        &source.to_rgba8(),
+                        projection,
+                        Interpolation::Bilinear,
+                        Border::Constant(Rgba([255, 255, 255, 255])),
+                        &mut output,
+                    );
+                    return Ok(DynamicImage::ImageRgba8(output));
+                }
+            }
+        }
+    }
+    let margin = ((max_x - min_x).min(max_y - min_y) * 0.08).clamp(2.0, 12.0);
+    let x = (min_x - margin).floor().max(0.0) as u32;
+    let y = (min_y - margin).floor().max(0.0) as u32;
+    let right = (max_x + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.width())) as u32;
+    let bottom = (max_y + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.height())) as u32;
     if right <= x || bottom <= y {
         bail!("geometry does not overlap the image");
     }
     Ok(source.crop_imm(x, y, right - x, bottom - y))
 }
 
+fn convex_quad(points: &[koharu_scene::Point]) -> bool {
+    let mut sign = 0.0_f64;
+    for index in 0..4 {
+        let a = points[index];
+        let b = points[(index + 1) % 4];
+        let c = points[(index + 2) % 4];
+        let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if cross.abs() < 1e-9 || (sign != 0.0 && sign.signum() != cross.signum()) {
+            return false;
+        }
+        sign = cross;
+    }
+    true
+}
+
+fn isolate_polygon_pixels(source: &DynamicImage, geometry: &Geometry) -> DynamicImage {
+    let (width, height) = source.dimensions();
+    let mut mask = GrayImage::new(width, height);
+    let points = geometry
+        .points
+        .iter()
+        .map(|point| ImagePoint::new(point.x.round() as i32, point.y.round() as i32))
+        .collect::<Vec<_>>();
+    draw_polygon_mut(&mut mask, &points, Luma([255]));
+    let mut isolated = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+    if let Some((min_x, min_y, max_x, max_y)) = geometry_extents(geometry) {
+        let first_x = min_x.floor().max(0.0) as u32;
+        let first_y = min_y.floor().max(0.0) as u32;
+        let last_x = max_x.ceil().min(f64::from(width)) as u32;
+        let last_y = max_y.ceil().min(f64::from(height)) as u32;
+        for y in first_y..last_y {
+            for x in first_x..last_x {
+                if mask.get_pixel(x, y).0[0] != 0 {
+                    isolated.put_pixel(x, y, source.get_pixel(x, y));
+                }
+            }
+        }
+    }
+    DynamicImage::ImageRgba8(isolated)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::normalize_ocr_text;
+    use super::{crop, normalize_ocr_text, text_direction};
+    use image::{DynamicImage, Rgba, RgbaImage};
+    use koharu_scene::{Geometry, Origin, Point, TextDirection};
+
+    #[test]
+    fn crop_straightens_a_rotated_text_region_and_keeps_a_margin() {
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(40, 40, Rgba([255; 4])));
+        let geometry = Geometry {
+            origin: Origin::User,
+            points: vec![
+                Point { x: 12.0, y: 8.0 },
+                Point { x: 24.0, y: 20.0 },
+                Point { x: 20.0, y: 24.0 },
+                Point { x: 8.0, y: 12.0 },
+            ],
+        };
+
+        let result = crop(&source, &geometry, false).unwrap();
+        assert!(result.width() > result.height());
+        assert!(result.width() >= 20);
+        assert!(result.height() >= 9);
+        assert_eq!(
+            text_direction(&geometry).unwrap(),
+            TextDirection::Horizontal
+        );
+    }
+
+    #[test]
+    fn manual_polygon_ocr_excludes_pixels_outside_the_selection() {
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_pixel(12, 12, Rgba([0, 0, 0, 255])));
+        let geometry = Geometry {
+            origin: Origin::User,
+            points: vec![
+                Point { x: 2.0, y: 2.0 },
+                Point { x: 10.0, y: 2.0 },
+                Point { x: 2.0, y: 10.0 },
+            ],
+        };
+        let selected = crop(&source, &geometry, true).unwrap().to_rgba8();
+        assert_eq!(selected.get_pixel(3, 3).0, [0, 0, 0, 255]);
+        assert_eq!(selected.get_pixel(8, 8).0, [255, 255, 255, 255]);
+
+        let concave = Geometry {
+            origin: Origin::User,
+            points: vec![
+                Point { x: 0.0, y: 0.0 },
+                Point { x: 12.0, y: 0.0 },
+                Point { x: 12.0, y: 12.0 },
+                Point { x: 7.0, y: 12.0 },
+                Point { x: 7.0, y: 5.0 },
+                Point { x: 5.0, y: 5.0 },
+                Point { x: 5.0, y: 12.0 },
+                Point { x: 0.0, y: 12.0 },
+            ],
+        };
+        let selected = crop(&source, &concave, true).unwrap().to_rgba8();
+        assert_eq!(selected.get_pixel(3, 9).0, [0, 0, 0, 255]);
+        assert_eq!(selected.get_pixel(6, 9).0, [255, 255, 255, 255]);
+    }
 
     #[test]
     fn repeated_placeholder_glyphs_are_an_ellipsis() {

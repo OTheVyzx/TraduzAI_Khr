@@ -5,7 +5,7 @@ use std::{collections::HashMap, sync::Arc};
 use vello::{
     FontEmbolden, Glyph, Scene,
     kurbo::{Affine, BezPath, Diagonal2, Join, Rect},
-    peniko::{Blob, Color, Fill, FontData, Mix},
+    peniko::{Blob, Color, Fill, FontData, Gradient, Mix},
 };
 
 use crate::{
@@ -489,7 +489,16 @@ fn compile_scene(
                     x: glyph.x,
                     y: glyph.y,
                 });
-                run.brush(rgba(prepared.color)).draw(Fill::NonZero, glyphs);
+                if let Some(gradient) = &prepared.gradient {
+                    let brush = Gradient::new_linear(
+                        (f64::from(gradient.start[0]), f64::from(gradient.start[1])),
+                        (f64::from(gradient.end[0]), f64::from(gradient.end[1])),
+                    )
+                    .with_stops([rgba(gradient.start_color), rgba(gradient.end_color)]);
+                    run.brush(&brush).draw(Fill::NonZero, glyphs);
+                } else {
+                    run.brush(rgba(prepared.color)).draw(Fill::NonZero, glyphs);
+                }
             }
             PreparedSceneCommand::FillPath(prepared) => {
                 let path = compile_path(prepared);

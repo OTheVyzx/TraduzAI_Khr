@@ -4,9 +4,10 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use koharu_rasterizer::{
-    PreparedGlyph, PreparedGlyphRun, PreparedResource, PreparedScene, PreparedSceneCommand,
-    ResourceId,
+    PreparedGlyph, PreparedGlyphRun, PreparedLinearGradient, PreparedResource, PreparedScene,
+    PreparedSceneCommand, ResourceId,
 };
+use koharu_scene::{TextGlow, TextGradient, TextShadow};
 use vello::kurbo::Affine;
 
 use crate::{
@@ -36,6 +37,11 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) writing_mode: WritingMode,
     pub(crate) foreground_color: [u8; 4],
     pub(crate) stroke: Option<StrokeOptions>,
+    pub(crate) shear_x: Option<f32>,
+    pub(crate) shear_y: Option<f32>,
+    pub(crate) shadow: Option<TextShadow>,
+    pub(crate) glow: Option<TextGlow>,
+    pub(crate) gradient: Option<TextGradient>,
     pub(crate) line_height: f32,
     pub(crate) letter_spacing: f32,
     pub(crate) word_spacing: f32,
@@ -73,6 +79,9 @@ pub(crate) struct TextRenderOptions {
     pub padding: f32,
     pub baseline_shift: f32,
     pub stroke: Option<StrokeOptions>,
+    pub shadow: Option<TextShadow>,
+    pub glow: Option<TextGlow>,
+    pub gradient: Option<PreparedLinearGradient>,
 }
 
 impl Default for TextRenderOptions {
@@ -83,6 +92,9 @@ impl Default for TextRenderOptions {
             padding: 0.0,
             baseline_shift: 0.0,
             stroke: None,
+            shadow: None,
+            glow: None,
+            gradient: None,
         }
     }
 }
@@ -110,6 +122,33 @@ impl TextRenderer {
         options: &TextRenderOptions,
         transform: Affine,
     ) {
+        if let Some(shadow) = options.shadow.as_ref().filter(|shadow| shadow.color[3] > 0) {
+            let shifted =
+                Affine::translate((f64::from(shadow.offset_x), f64::from(shadow.offset_y)))
+                    * transform;
+            draw_soft_effect(
+                scene,
+                resources,
+                layout,
+                writing_mode,
+                options,
+                shifted,
+                shadow.color,
+                shadow.blur_radius,
+            );
+        }
+        if let Some(glow) = options.glow.as_ref().filter(|glow| glow.color[3] > 0) {
+            draw_soft_effect(
+                scene,
+                resources,
+                layout,
+                writing_mode,
+                options,
+                transform,
+                glow.color,
+                glow.radius,
+            );
+        }
         // The border is drawn first as an outward-only dilation of the glyph outline (see
         // `draw_layout`), then the ordinary fill is drawn on top in the foreground color. Unlike a
         // centered stroke, a dilation never grows inward, so it can't punch a hole through small
@@ -128,6 +167,7 @@ impl TextRenderer {
                 GlyphPaint {
                     color: stroke.color,
                     dilation_px: stroke.width_px,
+                    gradient: None,
                 },
             );
         }
@@ -141,6 +181,7 @@ impl TextRenderer {
             GlyphPaint {
                 color: options.color,
                 dilation_px: 0.0,
+                gradient: options.gradient.clone(),
             },
         );
     }
@@ -245,11 +286,27 @@ impl TextRenderer {
         };
         x += layout.placement_offset_x();
         y += layout.placement_offset_y();
-        let transform = Affine::translate((f64::from(x), f64::from(y)));
+        let shear_x = descriptor.shear_x.unwrap_or(0.0);
+        let shear_y = descriptor.shear_y.unwrap_or(0.0);
+        let transform = text_shear_transform(x, y, layout.width, layout.height, shear_x, shear_y);
         let color = descriptor.foreground_color;
         let mut options = TextRenderOptions {
             color,
             stroke: None,
+            shadow: descriptor.shadow.clone(),
+            glow: descriptor.glow.clone(),
+            gradient: descriptor.gradient.as_ref().map(|gradient| {
+                let radians = gradient.angle_degrees.to_radians();
+                let (dx, dy) = (radians.cos(), radians.sin());
+                let span = dx.abs() * layout.width + dy.abs() * layout.height;
+                let midpoint = [layout.width * 0.5, layout.height * 0.5];
+                PreparedLinearGradient {
+                    start: [midpoint[0] - dx * span * 0.5, midpoint[1] - dy * span * 0.5],
+                    end: [midpoint[0] + dx * span * 0.5, midpoint[1] + dy * span * 0.5],
+                    start_color: gradient.start_color,
+                    end_color: gradient.end_color,
+                }
+            }),
             ..TextRenderOptions::default()
         };
         let mut scene = PreparedScene::default();
@@ -291,14 +348,42 @@ impl TextRenderer {
         let stroke_padding = descriptor
             .stroke
             .map_or(0.0, |stroke| stroke.width_px.max(0.0));
+        let glow_padding = descriptor.glow.as_ref().map_or(0.0, |glow| glow.radius);
+        let padding = stroke_padding.max(glow_padding);
+        let shear_padding_x = shear_x.abs() * (shear_y.abs() * layout.width + layout.height) * 0.5;
+        let shear_padding_y = shear_y.abs() * layout.width * 0.5;
+        let mut left = rendered_bounds.x - padding - shear_padding_x;
+        let mut top = rendered_bounds.y - padding - shear_padding_y;
+        let mut right = rendered_bounds.x + rendered_bounds.width + padding + shear_padding_x;
+        let mut bottom = rendered_bounds.y + rendered_bounds.height + padding + shear_padding_y;
+        if let Some(shadow) = &descriptor.shadow {
+            left = left
+                .min(rendered_bounds.x + shadow.offset_x - shadow.blur_radius - shear_padding_x);
+            top =
+                top.min(rendered_bounds.y + shadow.offset_y - shadow.blur_radius - shear_padding_y);
+            right = right.max(
+                rendered_bounds.x
+                    + rendered_bounds.width
+                    + shadow.offset_x
+                    + shadow.blur_radius
+                    + shear_padding_x,
+            );
+            bottom = bottom.max(
+                rendered_bounds.y
+                    + rendered_bounds.height
+                    + shadow.offset_y
+                    + shadow.blur_radius
+                    + shear_padding_y,
+            );
+        }
         Ok(RenderedTextNode {
             scene: Arc::new(scene),
             resources: resources.into(),
             local_bounds: RenderBounds {
-                x: rendered_bounds.x - stroke_padding,
-                y: rendered_bounds.y - stroke_padding,
-                width: rendered_bounds.width + stroke_padding * 2.0,
-                height: rendered_bounds.height + stroke_padding * 2.0,
+                x: left,
+                y: top,
+                width: right - left,
+                height: bottom - top,
             },
             metadata: RenderedTextMetadata {
                 rendered_bounds,
@@ -317,6 +402,22 @@ impl TextRenderer {
             diagnostics,
         })
     }
+}
+
+fn text_shear_transform(
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    shear_x: f32,
+    shear_y: f32,
+) -> Affine {
+    let center = (f64::from(width * 0.5), f64::from(height * 0.5));
+    Affine::translate((f64::from(x), f64::from(y)))
+        * Affine::translate(center)
+        * Affine::skew(f64::from(shear_x), 0.0)
+        * Affine::skew(0.0, f64::from(shear_y))
+        * Affine::translate((-center.0, -center.1))
 }
 
 fn automatic_maximum(
@@ -362,6 +463,68 @@ fn placement(rect: LayoutBox, width: f32, height: f32) -> (f32, f32) {
 struct GlyphPaint {
     color: [u8; 4],
     dilation_px: f32,
+    gradient: Option<PreparedLinearGradient>,
+}
+
+fn draw_soft_effect(
+    scene: &mut PreparedScene,
+    resources: &mut Vec<PreparedResource>,
+    layout: &LayoutRun<'_>,
+    writing_mode: WritingMode,
+    options: &TextRenderOptions,
+    transform: Affine,
+    color: [u8; 4],
+    radius: f32,
+) {
+    if radius <= 0.0 {
+        draw_layout(
+            scene,
+            resources,
+            layout,
+            writing_mode,
+            options,
+            transform,
+            GlyphPaint {
+                color,
+                dilation_px: 0.0,
+                gradient: None,
+            },
+        );
+        return;
+    }
+
+    // Portable display lists do not carry a blur filter. Several translucent outward
+    // dilations preserve the same soft edge in the canvas and native export.
+    for step in (1..=6).rev() {
+        let mut faded = color;
+        faded[3] = (f32::from(color[3]) / 6.0).round() as u8;
+        draw_layout(
+            scene,
+            resources,
+            layout,
+            writing_mode,
+            options,
+            transform,
+            GlyphPaint {
+                color: faded,
+                dilation_px: radius * step as f32 / 6.0,
+                gradient: None,
+            },
+        );
+    }
+    draw_layout(
+        scene,
+        resources,
+        layout,
+        writing_mode,
+        options,
+        transform,
+        GlyphPaint {
+            color,
+            dilation_px: 0.0,
+            gradient: None,
+        },
+    );
 }
 
 fn draw_layout(
@@ -425,6 +588,7 @@ fn draw_layout(
                     hint: options.hint_glyphs && paint.dilation_px == 0.0,
                     embolden: [synthetic_bold + paint.dilation_px; 2],
                     color: paint.color,
+                    gradient: paint.gradient.clone(),
                     glyphs,
                 }));
             start = end;
@@ -443,6 +607,20 @@ mod tests {
 
     use super::*;
     use crate::fonts::FontSystem;
+
+    #[test]
+    fn text_shear_moves_both_axes_around_the_same_center() {
+        let transform = text_shear_transform(10.0, 20.0, 100.0, 50.0, 0.2, 0.3);
+        let center = transform * vello::kurbo::Point::new(50.0, 25.0);
+        let top = transform * vello::kurbo::Point::new(50.0, 0.0);
+        let left = transform * vello::kurbo::Point::new(0.0, 25.0);
+
+        assert!((center.x - 60.0).abs() < 1e-5);
+        assert!((center.y - 45.0).abs() < 1e-5);
+        assert!((top.x - 55.0).abs() < 1e-5);
+        assert!((top.y - 20.0).abs() < 1e-5);
+        assert!((left.y - 30.0).abs() < 1e-5);
+    }
 
     #[test]
     fn automatic_size_preserves_free_text_default_and_balloon_extent() {
@@ -464,6 +642,11 @@ mod tests {
             writing_mode: WritingMode::Horizontal,
             foreground_color: [0, 0, 0, 255],
             stroke: None,
+            shear_x: None,
+            shear_y: None,
+            shadow: None,
+            glow: None,
+            gradient: None,
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -490,12 +673,21 @@ mod tests {
             .unwrap();
         let mut scene = PreparedScene::default();
         let mut resources = Vec::new();
+        let options = TextRenderOptions {
+            gradient: Some(PreparedLinearGradient {
+                start: [0.0, 0.0],
+                end: [160.0, 0.0],
+                start_color: [255, 0, 0, 255],
+                end_color: [0, 0, 255, 255],
+            }),
+            ..TextRenderOptions::default()
+        };
         TextRenderer::new().render(
             &mut scene,
             &mut resources,
             &layout,
             WritingMode::Horizontal,
-            &TextRenderOptions::default(),
+            &options,
             Affine::IDENTITY,
         );
         assert_eq!(resources.len(), 1);
@@ -564,5 +756,70 @@ mod tests {
             compiled.composition_commands(1).as_slice(),
             [CompositionCommand::Vector(_)]
         ));
+    }
+
+    #[test]
+    fn effects_record_ordered_passes_and_a_portable_gradient() {
+        let font = FontSystem::new().first_font().unwrap();
+        let layout = TextLayout::new(&font)
+            .with_font_size(24.0)
+            .run("Texto")
+            .unwrap();
+        let mut scene = PreparedScene::default();
+        let mut resources = Vec::new();
+        let options = TextRenderOptions {
+            color: [1, 2, 3, 255],
+            stroke: Some(StrokeOptions {
+                color: [4, 5, 6, 255],
+                width_px: 2.0,
+            }),
+            shadow: Some(TextShadow {
+                color: [7, 8, 9, 128],
+                offset_x: 3.0,
+                offset_y: 4.0,
+                blur_radius: 0.0,
+            }),
+            glow: Some(TextGlow {
+                color: [10, 11, 12, 128],
+                radius: 0.0,
+            }),
+            gradient: Some(PreparedLinearGradient {
+                start: [0.0, 0.0],
+                end: [100.0, 0.0],
+                start_color: [255, 0, 0, 255],
+                end_color: [0, 0, 255, 255],
+            }),
+            ..TextRenderOptions::default()
+        };
+        TextRenderer::new().render(
+            &mut scene,
+            &mut resources,
+            &layout,
+            WritingMode::Horizontal,
+            &options,
+            Affine::IDENTITY,
+        );
+
+        let colors: Vec<_> = scene
+            .commands
+            .iter()
+            .map(|command| match command {
+                PreparedSceneCommand::GlyphRun(run) => run.color,
+                _ => unreachable!("text records only glyph runs"),
+            })
+            .collect();
+        assert_eq!(
+            colors.as_slice(),
+            [
+                [7, 8, 9, 128],
+                [10, 11, 12, 128],
+                [4, 5, 6, 255],
+                [1, 2, 3, 255]
+            ]
+            .as_slice()
+        );
+        assert!(
+            matches!(&scene.commands[3], PreparedSceneCommand::GlyphRun(run) if run.gradient == options.gradient)
+        );
     }
 }

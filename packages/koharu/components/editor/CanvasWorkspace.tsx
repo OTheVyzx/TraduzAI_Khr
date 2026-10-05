@@ -10,7 +10,7 @@ import { StatusBar } from '@/components/editor/StatusBar'
 import { ToolBar } from '@/components/editor/ToolBar'
 import { useCanvas } from '@/components/editor/useCanvas'
 import { call } from '@/lib/backend'
-import { expandLayerSelection } from '@/lib/document'
+import { expandLayerSelection, isTextLayer } from '@/lib/document'
 import {
   controlFrame,
   draftFrame,
@@ -38,8 +38,16 @@ import {
   useKoharuStore,
   type CanvasTool,
 } from '@/lib/store'
+import { defaultTypography } from '@/lib/typography'
 import { prefetchCanvasPages, workspaceColor, type CanvasColor } from '@koharu/bridge/canvas'
-import { commands, type Frame, type Point, type TransformFrame } from '@koharu/bridge/protocol'
+import {
+  commands,
+  type EntityId,
+  type Frame,
+  type Point,
+  type TransformFrame,
+  type Typography,
+} from '@koharu/bridge/protocol'
 import { Button } from '@koharu/ui/components/button'
 
 const BRUSH_DIAMETER_STEP = 4
@@ -47,26 +55,44 @@ const BRUSH_DIAMETER_STEP = 4
 const canvasCursors = {
   select: undefined,
   text: 'text',
+  ocr_region: 'crosshair',
   draw: 'none',
   eraser: 'none',
+  restore_region: 'crosshair',
+  inpaint_region: 'crosshair',
   color_picker: 'crosshair',
   remove: 'none',
   pan: 'grab',
 } as const satisfies Record<CanvasTool, string | undefined>
 
 type Gesture =
-  | { kind: 'pan'; pointer: number; start: Point; translation: [number, number] }
+  | {
+      kind: 'pan'
+      pointer: number
+      start: Point
+      translation: [number, number]
+    }
   | { kind: 'move'; pointer: number; start: Point; originals: TransformFrame[] }
   | { kind: 'text'; pointer: number; start: Point; frame: Frame }
   | StrokeGesture
 
+interface PolygonDraft {
+  action: 'ocr' | 'restore' | 'inpaint'
+  page: EntityId
+  revision: number
+  points: Point[]
+  cursor: Point
+}
+
 interface StrokeGesture {
   kind: 'paint' | 'erase' | 'inpaint'
   pointer: number
+  page: EntityId
   revision: number
   layer: string | null
   points: Point[]
   diameter: number
+  hardness: number
   color?: CanvasColor
 }
 
@@ -80,22 +106,41 @@ interface StrokeUpdate {
   points: Point[]
 }
 
+interface CopiedTextLayer {
+  sourceText: string
+  translationText: string | null
+  typography: Typography
+  layout: 'point' | 'paragraph'
+  frame: Frame
+}
+
 export function CanvasWorkspace() {
   const { t } = useTranslation()
   const surface = useRef<HTMLDivElement>(null)
   const [canvasElement, setCanvasElement] = useState<HTMLCanvasElement | null>(null)
   const gesture = useRef<Gesture | null>(null)
+  const polygon = useRef<PolygonDraft | null>(null)
   const previousPageIndex = useRef<number | null>(null)
   const spaceHeld = useRef(false)
   const transformActive = useRef(false)
   const transformRevision = useRef<number | null>(null)
+  const transformPage = useRef<EntityId | null>(null)
   const transformFinal = useRef<TransformFrame[]>([])
+  const shearGesture = useRef<{
+    element: string
+    frame: Frame
+    axis: 'x' | 'y'
+    original: { x: number; y: number }
+  } | null>(null)
   const commitPending = useRef(false)
   const commandQueue = useRef<Promise<void>>(Promise.resolve())
+  const textClipboard = useRef<CopiedTextLayer[] | null>(null)
   const [previews, setPreviews] = useState<Record<string, Frame>>({})
   const [draft, setDraft] = useState<Frame | null>(null)
+  const [polygonDraft, setPolygonDraft] = useState<PolygonDraft | null>(null)
   const [hovered, setHovered] = useState<string | null>(null)
   const [cursor, setCursor] = useState<Point | null>(null)
+  const [snapGuides, setSnapGuides] = useState({ x: false, y: false })
   const colorSampling = useColorSampling()
 
   const page = usePage().data
@@ -107,18 +152,30 @@ export function CanvasWorkspace() {
   const canvasSize = useKoharuStore((state) => state.canvasSize)
   const fitCanvasRequest = useKoharuStore((state) => state.fitCanvasRequest)
   const layerFrames = useKoharuStore((state) => state.layerFrames)
+  const fontSizes = useKoharuStore((state) => state.fontSizes)
+  const resizeMode = useKoharuStore((state) => state.resizeMode)
+  const defaultFontSize = useKoharuStore((state) => state.defaultFontSize)
+  const ocrRegionAngle = useKoharuStore((state) => state.ocrRegionAngle)
   const tool = useKoharuStore((state) => state.tool)
+  const snapToCenter = useKoharuStore((state) => state.snapToCenter)
   const brush = useKoharuStore((state) => state.brush)
   const selected = useKoharuStore((state) => state.selectedLayers)
   const selectLayers = useKoharuStore((state) => state.selectLayers)
   const setTool = useKoharuStore((state) => state.setTool)
   const setBrush = useKoharuStore((state) => state.setBrush)
   const requestCanvasFit = useKoharuStore((state) => state.requestCanvasFit)
-  const canvasState = useCanvas(canvasElement, canvasRevision, canvasGeneration)
+  const canvasState = useCanvas(canvasElement, canvasRevision, canvasGeneration, page?.id ?? null)
   const canvas = canvasState.canvas
   const pageId = page?.id
+  const canvasActiveRevision = canvasState.activeRevision
   const pageWidth = canvasSize[0] || page?.size.width
   const pageHeight = canvasSize[1] || page?.size.height
+  const canvasInteractive =
+    Boolean(page) &&
+    canvasState.activePage === page?.id &&
+    canvasState.activeRevision !== null &&
+    canvasState.hasFrame &&
+    (canvasState.status === 'ready' || canvasState.status === 'switching')
   const activeRaster =
     selected.length === 1
       ? page?.layers.find((layer) => layer.id === selected[0] && layer.type === 'raster')
@@ -133,11 +190,65 @@ export function CanvasWorkspace() {
     return pending
   }, [])
 
-  const transformUpdates = useFrameCommand((elements: TransformFrame[]) =>
-    canvas?.updateTransform(elements),
-  )
+  const pasteCopiedText = useCallback((): boolean => {
+    const copied = textClipboard.current
+    if (!page || !copied?.length) return false
+    if (commitPending.current) return true
+    commitPending.current = true
+    void enqueue(async () => {
+      const created: TransformFrame[] = []
+      try {
+        const offset = (12 * window.devicePixelRatio) / camera.zoom
+        for (const item of copied) {
+          const frame = {
+            ...item.frame,
+            x: clamp(item.frame.x + offset, 0, Math.max(0, page.size.width - item.frame.width)),
+            y: clamp(item.frame.y + offset, 0, Math.max(0, page.size.height - item.frame.height)),
+          }
+          const result =
+            item.layout === 'point'
+              ? await call(commands.addPointText, { x: frame.x, y: frame.y })
+              : await call(commands.addTextBox, frame)
+          created.push({ element: result.layer, frame })
+          await call(commands.setSourceText, result.layer, item.sourceText)
+          await call(commands.setTranslation, result.layer, item.translationText)
+          await call(commands.setTypography, [{ layer: result.layer, typography: item.typography }])
+        }
+        const project = await call(commands.getProject)
+        if (project && page) await call(commands.commitTransform, project.revision, page.id, created)
+        selectLayers(created.map(({ element }) => element))
+        await refresh(projectKey, pagesKey, pageKey)
+      } catch (error) {
+        if (created.length) {
+          await call(
+            commands.deleteLayers,
+            created.map(({ element }) => element),
+          ).catch(() => undefined)
+          await refresh(projectKey, pagesKey, pageKey).catch(() => undefined)
+        }
+        throw error
+      }
+    })
+      .catch((error: unknown) => receiveError(errorMessage(error)))
+      .finally(() => (commitPending.current = false))
+    return true
+  }, [camera.zoom, enqueue, page, selectLayers])
+
+  const transformUpdates = useFrameCommand((elements: TransformFrame[]) => {
+    try {
+      canvas?.updateTransform(elements)
+    } catch {
+      // A frame swap can discard the local preview; the durable transform still commits on release.
+    }
+  })
   const strokeUpdates = useFrameCommand(
-    ({ points }: StrokeUpdate) => canvas?.extendStroke(points),
+    ({ points }: StrokeUpdate) => {
+      try {
+        canvas?.extendStroke(points)
+      } catch {
+        // Stroke points are retained in the gesture and committed even if its preview was replaced.
+      }
+    },
     mergeStrokeUpdates,
   )
 
@@ -145,7 +256,8 @@ export function CanvasWorkspace() {
     (elements: TransformFrame[]) => {
       if (
         !canvas ||
-        canvasRevision === null ||
+        canvasActiveRevision === null ||
+        !canvasInteractive ||
         !elements.length ||
         transformActive.current ||
         commitPending.current
@@ -153,17 +265,17 @@ export function CanvasWorkspace() {
         return
       transformUpdates.clear()
       transformActive.current = true
-      transformRevision.current = canvasRevision
+      transformRevision.current = canvasActiveRevision
+      transformPage.current = page?.id ?? null
       transformFinal.current = elements
       setPreviews(Object.fromEntries(elements.map(({ element, frame }) => [element, frame])))
       try {
         canvas.beginTransform(elements)
-      } catch (error) {
-        transformActive.current = false
-        receiveError(errorMessage(error))
+      } catch {
+        canvas.cancelTransform()
       }
     },
-    [canvas, canvasRevision, transformUpdates],
+    [canvas, canvasActiveRevision, canvasInteractive, page, transformUpdates],
   )
 
   const updateTransform = useCallback(
@@ -176,34 +288,159 @@ export function CanvasWorkspace() {
     [transformUpdates],
   )
 
-  const finishTransform = useCallback(() => {
-    if (!transformActive.current) return
-    transformUpdates.commit()
-    transformActive.current = false
-    const revision = transformRevision.current
-    const elements = transformFinal.current
-    transformRevision.current = null
-    try {
-      canvas?.finishTransform()
-    } catch (error) {
-      receiveError(errorMessage(error))
-      setPreviews({})
-      return
-    }
-    if (revision === null) {
-      canvas?.cancelTransform()
-      setPreviews({})
-      return
-    }
-    commitPending.current = true
-    void enqueue(() => call(commands.commitTransform, revision, elements))
-      .then((revision) => (revision === null ? undefined : refresh(projectKey, pagesKey, pageKey)))
-      .catch(() => canvas?.cancelTransform())
-      .finally(() => {
-        commitPending.current = false
+  const finishTransform = useCallback(
+    (resize?: { element: string; size: number }) => {
+      if (!transformActive.current) return
+      transformUpdates.commit()
+      transformActive.current = false
+      const revision = transformRevision.current
+      const pageId = transformPage.current
+      const elements = transformFinal.current
+      transformRevision.current = null
+      transformPage.current = null
+      try {
+        canvas?.finishTransform()
+      } catch {
+        canvas?.cancelTransform()
+      }
+      if (revision === null || pageId === null) {
+        canvas?.cancelTransform()
         setPreviews({})
+        return
+      }
+      commitPending.current = true
+      void enqueue(async () => {
+        const next = await call(commands.commitTransform, revision, pageId, elements)
+        if (next === null) return
+        if (resize) {
+          const layer = page?.layers.find((candidate) => candidate.id === resize.element)
+          if (layer?.type === 'text') {
+            await call(commands.setTypography, [
+              {
+                layer: resize.element,
+                typography: {
+                  ...(layer.typography ?? defaultTypography),
+                  size: resize.size,
+                  auto_fit: false,
+                },
+              },
+            ])
+          }
+        }
+        await refresh(projectKey, pagesKey, pageKey)
       })
-  }, [canvas, enqueue, transformUpdates])
+        .catch(() => canvas?.cancelTransform())
+        .finally(() => {
+          commitPending.current = false
+          setPreviews({})
+        })
+    },
+    [canvas, enqueue, page, transformUpdates],
+  )
+
+  const beginShear = useCallback(
+    (element: string, frame: Frame, axis: 'x' | 'y') => {
+      if (!canvas || shearGesture.current || transformActive.current || commitPending.current)
+        return
+      const layer = page?.layers.find((candidate) => candidate.id === element)
+      if (layer?.type !== 'text') return
+      const original = {
+        x: layer.typography?.shear_x ?? 0,
+        y: layer.typography?.shear_y ?? 0,
+      }
+      shearGesture.current = { element, frame, axis, original }
+      try {
+        canvas.beginTransform([{ element, frame }], original)
+      } catch {
+        canvas.cancelTransform()
+      }
+    },
+    [canvas, page],
+  )
+
+  const previewShear = useCallback(
+    (element: string, frame: Frame, axis: 'x' | 'y', shear: number) => {
+      const current = shearGesture.current
+      if (!current || current.element !== element || current.axis !== axis) return
+      try {
+        canvas?.updateTransform([{ element, frame }], {
+          ...current.original,
+          [axis]: shear,
+        })
+      } catch {
+        canvas?.cancelTransform()
+      }
+    },
+    [canvas],
+  )
+
+  const finishShear = useCallback(
+    (element: string, axis: 'x' | 'y', shear: number) => {
+      if (shearGesture.current?.element !== element || shearGesture.current.axis !== axis) return
+      shearGesture.current = null
+      try {
+        canvas?.finishTransform()
+      } catch (error) {
+        canvas?.cancelTransform()
+        receiveError(errorMessage(error))
+      }
+      const layer = page?.layers.find((candidate) => candidate.id === element)
+      if (layer?.type !== 'text') return
+      void enqueue(async () => {
+        await call(commands.setTypography, [
+          {
+            layer: element,
+            typography: {
+              ...(layer.typography ?? defaultTypography),
+              [axis === 'x' ? 'shear_x' : 'shear_y']: shear,
+            },
+          },
+        ])
+        await refresh(projectKey, pageKey)
+      }).catch(() => undefined)
+    },
+    [canvas, enqueue, page],
+  )
+
+  const finishPolygon = useCallback(() => {
+    const selection = polygon.current
+    if (!selection || selection.points.length < 3) return
+    polygon.current = null
+    setPolygonDraft(null)
+    commitPending.current = true
+    const operation =
+      selection.action === 'ocr'
+        ? () =>
+            call(
+              commands.recognizeSelectedRegion,
+              selection.revision,
+              selection.page,
+              selection.points,
+              defaultFontSize,
+              ocrRegionAngle,
+            ).then((result) => {
+              selectLayers([result.layer])
+              return refresh(projectKey, pagesKey, pageKey)
+            })
+        : selection.action === 'restore'
+          ? () =>
+            call(
+              commands.restoreOriginalRegion,
+              selection.revision,
+              selection.page,
+              selection.points,
+            ).then(() => refresh(projectKey, pagesKey, pageKey))
+          : () =>
+              call(
+                commands.commitInpaintRegion,
+                selection.revision,
+                selection.page,
+                selection.points,
+              ).then(() => undefined)
+    void enqueue(operation)
+      .catch((error) => receiveError(errorMessage(error)))
+      .finally(() => (commitPending.current = false))
+  }, [defaultFontSize, enqueue, ocrRegionAngle, selectLayers])
 
   const cancelGesture = useCallback(() => {
     const current = gesture.current
@@ -216,10 +453,18 @@ export function CanvasWorkspace() {
       transformUpdates.clear()
       transformActive.current = false
       transformRevision.current = null
+      transformPage.current = null
       canvas?.cancelTransform()
     }
+    if (shearGesture.current) {
+      shearGesture.current = null
+      canvas?.cancelTransform()
+    }
+    polygon.current = null
+    setPolygonDraft(null)
     setDraft(null)
     setPreviews({})
+    setSnapGuides({ x: false, y: false })
   }, [canvas, strokeUpdates, transformUpdates])
 
   const fitCanvas = useCallback(() => {
@@ -245,7 +490,10 @@ export function CanvasWorkspace() {
     const bounds = element.getBoundingClientRect()
     const dpr = window.devicePixelRatio
     const current = useKoharuStore.getState().camera
-    const center = { x: bounds.width * dpr * 0.5, y: bounds.height * dpr * 0.5 }
+    const center = {
+      x: bounds.width * dpr * 0.5,
+      y: bounds.height * dpr * 0.5,
+    }
     const pageX = (center.x - current.translation[0]) / current.zoom
     const pageY = (center.y - current.translation[1]) / current.zoom
     useKoharuStore.setState({
@@ -264,7 +512,10 @@ export function CanvasWorkspace() {
     const resize = new ResizeObserver(report)
     const theme = new MutationObserver(report)
     resize.observe(element)
-    theme.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+    theme.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
+    })
     window.addEventListener('resize', report)
     window.visualViewport?.addEventListener('resize', report)
     return () => {
@@ -309,7 +560,9 @@ export function CanvasWorkspace() {
     fitCanvas()
   }, [fitCanvas, fitCanvasRequest])
 
-  useEffect(() => cancelGesture, [cancelGesture, canvasGeneration, canvasRevision, page?.id, tool])
+  useEffect(() => {
+    if (!canvasInteractive) cancelGesture()
+  }, [cancelGesture, canvasInteractive, page?.id, tool])
 
   useEffect(() => {
     const editable = (target: EventTarget | null) =>
@@ -323,6 +576,18 @@ export function CanvasWorkspace() {
         return
       }
       if (editable(event.target)) return
+      if (polygon.current && event.key === 'Enter') {
+        event.preventDefault()
+        finishPolygon()
+        return
+      }
+      if (polygon.current && event.key === 'Backspace') {
+        event.preventDefault()
+        const points = polygon.current.points.slice(0, -1)
+        polygon.current = points.length ? { ...polygon.current, points } : null
+        setPolygonDraft(polygon.current)
+        return
+      }
       const state = useKoharuStore.getState()
       if (event.code === 'Space') {
         spaceHeld.current = true
@@ -330,6 +595,33 @@ export function CanvasWorkspace() {
         return
       }
       const command = event.ctrlKey || event.metaKey
+      if (command && event.key.toLowerCase() === 'c' && page && !polygon.current) {
+        const copied = expandLayerSelection(page.layers, state.selectedLayers).flatMap((id) => {
+          const layer = page.layers.find((candidate) => candidate.id === id)
+          if (!layer || !isTextLayer(layer)) return []
+          const frame = controlFrame(layer, layerFrames)
+          return frame
+            ? [
+                {
+                  sourceText: layer.content.source?.text ?? '',
+                  translationText: layer.content.translation?.text ?? null,
+                  typography: structuredClone(layer.typography ?? defaultTypography),
+                  layout: layer.layout,
+                  frame,
+                },
+              ]
+            : []
+        })
+        if (copied.length) {
+          event.preventDefault()
+          textClipboard.current = copied
+        }
+        return
+      }
+      if (command && event.key.toLowerCase() === 'v' && !polygon.current && pasteCopiedText()) {
+        event.preventDefault()
+        return
+      }
       if (command && event.key.toLowerCase() === 'z') {
         event.preventDefault()
         void call(event.shiftKey ? commands.redo : commands.undo)
@@ -363,7 +655,18 @@ export function CanvasWorkspace() {
         return
       }
       const next = (
-        ['select', 'text', 'draw', 'eraser', 'color_picker', 'remove', 'pan'] as const
+        [
+          'select',
+          'text',
+          'ocr_region',
+          'inpaint_region',
+          'draw',
+          'eraser',
+          'restore_region',
+          'color_picker',
+          'remove',
+          'pan',
+        ] as const
       ).find((action) => state.shortcuts[action] === event.key.toLowerCase())
       if (next) setTool(next)
     }
@@ -385,7 +688,17 @@ export function CanvasWorkspace() {
       window.removeEventListener('keyup', up)
       window.removeEventListener('blur', blur)
     }
-  }, [cancelGesture, colorSampling, page, requestCanvasFit, selectLayers, setTool])
+  }, [
+    cancelGesture,
+    colorSampling,
+    finishPolygon,
+    layerFrames,
+    page,
+    pasteCopiedText,
+    requestCanvasFit,
+    selectLayers,
+    setTool,
+  ])
 
   const clientPagePoint = (clientX: number, clientY: number) =>
     pagePoint(
@@ -414,6 +727,17 @@ export function CanvasWorkspace() {
     if (!page || !sample) return
     const physical = clientPhysicalPoint(sample.clientX, sample.clientY)
     setCursor(physical)
+    if (polygon.current) {
+      const pagePoint = clientPagePoint(sample.clientX, sample.clientY)
+      polygon.current = {
+        ...polygon.current,
+        cursor: {
+          x: clamp(pagePoint.x, 0, page.size.width),
+          y: clamp(pagePoint.y, 0, page.size.height),
+        },
+      }
+      setPolygonDraft(polygon.current)
+    }
     if (!current || current.pointer !== pointer) {
       if (tool === 'select') {
         setHovered(
@@ -440,19 +764,39 @@ export function CanvasWorkspace() {
         bounds.height * dpr,
         dpr,
       )
-      useKoharuStore.setState({ camera: { zoom: camera.zoom, translation, fitted: false } })
+      useKoharuStore.setState({
+        camera: { zoom: camera.zoom, translation, fitted: false },
+      })
       return
     }
 
     const points = samples.map((value) => clientPagePoint(value.clientX, value.clientY))
     const point = points.at(-1)!
     if (current.kind === 'move') {
-      updateTransform(
-        translateFrames(current.originals, {
-          x: point.x - current.start.x,
-          y: point.y - current.start.y,
-        }),
-      )
+      const moved = translateFrames(current.originals, {
+        x: point.x - current.start.x,
+        y: point.y - current.start.y,
+      })
+      if (snapToCenter) {
+        const center = framesBoundsCenter(moved)
+        const tolerance = (8 * window.devicePixelRatio) / camera.zoom
+        const difference = {
+          x: page.size.width * 0.5 - center.x,
+          y: page.size.height * 0.5 - center.y,
+        }
+        const snapX = Math.abs(difference.x) <= tolerance
+        const snapY = Math.abs(difference.y) <= tolerance
+        setSnapGuides({ x: snapX, y: snapY })
+        updateTransform(
+          translateFrames(moved, {
+            x: snapX ? difference.x : 0,
+            y: snapY ? difference.y : 0,
+          }),
+        )
+      } else {
+        setSnapGuides({ x: false, y: false })
+        updateTransform(moved)
+      }
     } else if (current.kind === 'text') {
       current.frame = draftFrame(current.start, point)
       setDraft(current.frame)
@@ -467,6 +811,7 @@ export function CanvasWorkspace() {
     gesture.current = null
     if (!current || !page) return
     if (current.kind === 'move') {
+      setSnapGuides({ x: false, y: false })
       finishTransform()
     } else if (current.kind === 'text') {
       const pointText =
@@ -477,7 +822,19 @@ export function CanvasWorkspace() {
           ? call(commands.addPointText, current.start)
           : call(commands.addTextBox, current.frame)
       )
-        .then((result) => {
+        .then(async (result) => {
+          if (defaultFontSize !== null) {
+            await call(commands.setTypography, [
+              {
+                layer: result.layer,
+                typography: {
+                  ...defaultTypography,
+                  size: defaultFontSize,
+                  auto_fit: false,
+                },
+              },
+            ])
+          }
           selectLayers([result.layer])
           return refresh(projectKey, pagesKey, pageKey)
         })
@@ -486,37 +843,45 @@ export function CanvasWorkspace() {
       strokeUpdates.commit()
       try {
         canvas?.finishStroke()
-      } catch (error) {
-        receiveError(errorMessage(error))
-        return
+      } catch {
+        canvas?.cancelStroke()
       }
       const operation =
         current.kind === 'paint'
           ? enqueue(() =>
-            call(commands.commitPaint, current.revision, current.layer, current.points, {
-              diameter: current.diameter,
-              color: current.color!,
-            }),
-          ).then((result) => {
-            selectLayers([result.layer])
-            return refresh(projectKey, pagesKey, pageKey)
-          })
-          : current.kind === 'erase'
-            ? enqueue(() =>
-              call(
-                commands.commitErase,
-                current.revision,
-                current.layer!,
-                current.points,
-                current.diameter,
-              ),
+              call(commands.commitPaint, current.revision, current.page, current.layer, current.points, {
+                diameter: current.diameter,
+                hardness: current.hardness,
+                color: current.color!,
+              }),
             ).then((result) => {
               selectLayers([result.layer])
               return refresh(projectKey, pagesKey, pageKey)
             })
+          : current.kind === 'erase'
+            ? enqueue(() =>
+                call(
+                  commands.commitErase,
+                  current.revision,
+                  current.page,
+                  current.layer!,
+                  current.points,
+                  current.diameter,
+                  current.hardness,
+                ),
+              ).then((result) => {
+                selectLayers([result.layer])
+                return refresh(projectKey, pagesKey, pageKey)
+              })
             : enqueue(() =>
-              call(commands.commitInpaint, current.revision, current.points, current.diameter),
-            )
+              call(
+                commands.commitInpaint,
+                current.revision,
+                current.page,
+                current.points,
+                current.diameter,
+              ),
+              )
       commitPending.current = true
       void operation
         .catch(() => canvas?.cancelStroke())
@@ -533,18 +898,18 @@ export function CanvasWorkspace() {
           ref={surface}
           tabIndex={0}
           aria-label={t('canvas.surface')}
-          aria-busy={page ? canvasState.status !== 'ready' : undefined}
+          aria-busy={page ? !canvasInteractive : undefined}
           className='relative min-h-0 min-w-0 flex-1 touch-none overflow-hidden bg-[var(--surface-canvas)] outline-none'
           style={{
-            cursor: page && canvasState.status === 'ready' ? canvasCursors[tool] : undefined,
+            cursor: page && canvasInteractive ? canvasCursors[tool] : undefined,
           }}
           onContextMenu={(event) => event.preventDefault()}
           onPointerDown={(event) => {
             if (
               !page ||
               !canvas ||
-              canvasState.status !== 'ready' ||
-              canvasRevision === null ||
+              !canvasInteractive ||
+              canvasActiveRevision === null ||
               commitPending.current ||
               event.button > 1
             )
@@ -556,6 +921,51 @@ export function CanvasWorkspace() {
             const physical = clientPhysicalPoint(event.clientX, event.clientY)
             const point = clientPagePoint(event.clientX, event.clientY)
             setCursor(physical)
+
+            if (
+              event.button === 0 &&
+              !spaceHeld.current &&
+              (tool === 'ocr_region' || tool === 'restore_region' || tool === 'inpaint_region')
+            ) {
+              const vertex = {
+                x: clamp(point.x, 0, page.size.width),
+                y: clamp(point.y, 0, page.size.height),
+              }
+              const action =
+                tool === 'ocr_region' ? 'ocr' : tool === 'restore_region' ? 'restore' : 'inpaint'
+              const current = polygon.current
+              if (current && current.action === action) {
+                const closeDistance = (8 * window.devicePixelRatio) / camera.zoom
+                const distance = (a: Point) => Math.hypot(a.x - vertex.x, a.y - vertex.y)
+                if (
+                  current.points.length >= 3 &&
+                  (distance(current.points[0]) <= closeDistance ||
+                    distance(current.points[current.points.length - 1]) <= closeDistance)
+                ) {
+                  finishPolygon()
+                } else if (current.points.length >= 256) {
+                  receiveError('O polígono pode ter no máximo 256 vértices.')
+                } else if (distance(current.points[current.points.length - 1]) > 0.5) {
+                  polygon.current = {
+                    ...current,
+                    points: [...current.points, vertex],
+                    cursor: vertex,
+                  }
+                  setPolygonDraft(polygon.current)
+                }
+              } else {
+                polygon.current = {
+                  action,
+                  page: page.id,
+                  revision: canvasActiveRevision!,
+                  points: [vertex],
+                  cursor: vertex,
+                }
+                setPolygonDraft(polygon.current)
+              }
+              event.preventDefault()
+              return
+            }
 
             if (event.button === 1 || tool === 'pan' || spaceHeld.current) {
               gesture.current = {
@@ -582,11 +992,21 @@ export function CanvasWorkspace() {
               if (!next.includes(target.id)) return
               const originals = framesFor(next)
               if (!originals.length) return
-              gesture.current = { kind: 'move', pointer: event.pointerId, start: point, originals }
+              gesture.current = {
+                kind: 'move',
+                pointer: event.pointerId,
+                start: point,
+                originals,
+              }
               beginTransform(originals)
             } else if (tool === 'text') {
               const frame = draftFrame(point, point)
-              gesture.current = { kind: 'text', pointer: event.pointerId, start: point, frame }
+              gesture.current = {
+                kind: 'text',
+                pointer: event.pointerId,
+                start: point,
+                frame,
+              }
               setDraft(frame)
             } else if (tool === 'draw') {
               strokeUpdates.clear()
@@ -594,10 +1014,12 @@ export function CanvasWorkspace() {
               gesture.current = {
                 kind: 'paint',
                 pointer: event.pointerId,
-                revision: canvasRevision,
+                page: page.id,
+                revision: canvasActiveRevision!,
                 layer: activeRaster?.id ?? null,
                 points: [point],
                 diameter: brush.diameter,
+                hardness: brush.hardness,
                 color,
               }
               try {
@@ -606,11 +1028,11 @@ export function CanvasWorkspace() {
                   layer: activeRaster?.id ?? null,
                   point,
                   diameter: brush.diameter,
+                  hardness: brush.hardness,
                   color,
                 })
-              } catch (error) {
-                gesture.current = null
-                receiveError(errorMessage(error))
+              } catch {
+                canvas.cancelStroke()
               }
             } else if (tool === 'eraser') {
               if (!activeRaster) {
@@ -621,10 +1043,12 @@ export function CanvasWorkspace() {
               gesture.current = {
                 kind: 'erase',
                 pointer: event.pointerId,
-                revision: canvasRevision,
+                page: page.id,
+                revision: canvasActiveRevision!,
                 layer: activeRaster.id,
                 points: [point],
                 diameter: brush.diameter,
+                hardness: brush.hardness,
               }
               try {
                 canvas.beginStroke({
@@ -632,20 +1056,22 @@ export function CanvasWorkspace() {
                   layer: activeRaster.id,
                   point,
                   diameter: brush.diameter,
+                  hardness: brush.hardness,
                 })
-              } catch (error) {
-                gesture.current = null
-                receiveError(errorMessage(error))
+              } catch {
+                canvas.cancelStroke()
               }
             } else if (tool === 'remove') {
               strokeUpdates.clear()
               gesture.current = {
                 kind: 'inpaint',
                 pointer: event.pointerId,
-                revision: canvasRevision,
+                page: page.id,
+                revision: canvasActiveRevision!,
                 layer: null,
                 points: [point],
                 diameter: brush.diameter,
+                hardness: 100,
               }
               try {
                 canvas.beginStroke({
@@ -653,10 +1079,10 @@ export function CanvasWorkspace() {
                   layer: null,
                   point,
                   diameter: brush.diameter,
+                  hardness: 100,
                 })
-              } catch (error) {
-                gesture.current = null
-                receiveError(errorMessage(error))
+              } catch {
+                canvas.cancelStroke()
               }
             } else if (tool === 'color_picker') {
               void canvas
@@ -739,7 +1165,9 @@ export function CanvasWorkspace() {
               bounds.height * dpr,
               dpr,
             )
-            useKoharuStore.setState({ camera: { zoom, translation, fitted: false } })
+            useKoharuStore.setState({
+              camera: { zoom, translation, fitted: false },
+            })
           }}
         >
           <canvas
@@ -748,7 +1176,7 @@ export function CanvasWorkspace() {
             aria-hidden
             className='pointer-events-none absolute inset-0 block size-full'
           />
-          {page && canvasState.status === 'ready' && (
+          {page && canvasInteractive && (
             <CanvasOverlay
               page={page}
               camera={camera}
@@ -756,13 +1184,39 @@ export function CanvasWorkspace() {
               hovered={hovered}
               frames={layerFrames}
               previews={previews}
+              fontSizes={fontSizes}
+              resizeMode={resizeMode}
               draft={draft}
+              polygonDraft={polygonDraft}
               cursor={cursor}
               brushSize={brush.diameter}
+              brushHardness={brush.hardness}
               showBrushCursor={isBrushTool(tool)}
+              showSelectionControls={tool === 'select'}
               onTransformStart={beginTransform}
               onTransformFrame={updateTransform}
               onTransformEnd={finishTransform}
+              onShearStart={beginShear}
+              onShearPreview={previewShear}
+              onShearEnd={finishShear}
+            />
+          )}
+          {page && snapGuides.x && (
+            <div
+              aria-hidden
+              className='pointer-events-none absolute inset-y-0 z-10 border-l border-dashed border-fuchsia-400/90 shadow-[0_0_5px_rgba(232,121,249,0.8)]'
+              style={{
+                left: `${(camera.translation[0] + (page.size.width * camera.zoom) / 2) / window.devicePixelRatio}px`,
+              }}
+            />
+          )}
+          {page && snapGuides.y && (
+            <div
+              aria-hidden
+              className='pointer-events-none absolute inset-x-0 z-10 border-t border-dashed border-fuchsia-400/90 shadow-[0_0_5px_rgba(232,121,249,0.8)]'
+              style={{
+                top: `${(camera.translation[1] + (page.size.height * camera.zoom) / 2) / window.devicePixelRatio}px`,
+              }}
             />
           )}
           {page && canvasState.status === 'error' && (
@@ -830,6 +1284,29 @@ function rgbaToHex(color: [number, number, number, number]): string {
 
 function clamp(value: number, minimum: number, maximum: number): number {
   return Math.min(maximum, Math.max(minimum, value))
+}
+
+function framesBoundsCenter(elements: TransformFrame[]): Point {
+  let left = Number.POSITIVE_INFINITY
+  let top = Number.POSITIVE_INFINITY
+  let right = Number.NEGATIVE_INFINITY
+  let bottom = Number.NEGATIVE_INFINITY
+  for (const { frame } of elements) {
+    const centerX = frame.x + frame.width * 0.5
+    const centerY = frame.y + frame.height * 0.5
+    const radians = (frame.angle_degrees * Math.PI) / 180
+    const halfWidth =
+      Math.abs(Math.cos(radians)) * frame.width * 0.5 +
+      Math.abs(Math.sin(radians)) * frame.height * 0.5
+    const halfHeight =
+      Math.abs(Math.sin(radians)) * frame.width * 0.5 +
+      Math.abs(Math.cos(radians)) * frame.height * 0.5
+    left = Math.min(left, centerX - halfWidth)
+    right = Math.max(right, centerX + halfWidth)
+    top = Math.min(top, centerY - halfHeight)
+    bottom = Math.max(bottom, centerY + halfHeight)
+  }
+  return { x: (left + right) * 0.5, y: (top + bottom) * 0.5 }
 }
 
 function containCamera(
@@ -907,7 +1384,7 @@ class FrameCommand<Value> {
   constructor(
     private readonly execute: (value: Value) => void | Promise<unknown>,
     private readonly merge: (current: Value, next: Value) => Value = (_current, next) => next,
-  ) { }
+  ) {}
 
   schedule(value: Value): void {
     this.pending = this.pending === undefined ? value : this.merge(this.pending, value)

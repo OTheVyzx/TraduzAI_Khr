@@ -13,8 +13,8 @@ use koharu_scene::{
     Asset, AssetRole, BlobId, Change, Component, ComponentOwner, EntityChange, EntityId, FitsTo,
     FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, Presents, RasterLayer, RasterLayerKind,
     RecognizedFrom, Region, RelationChange, RelationId, RelationSpec, Revision, Snapshot,
-    TextAlignment, TextDirection, TextLayout as SceneTextLayout, TextLayoutKind, Translation,
-    Typography, Visibility,
+    TextAlignment, TextDirection, TextLayout as SceneTextLayout, TextLayoutKind, TextPlacement,
+    Translation, Typography, Visibility,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -738,7 +738,17 @@ impl Traversal<'_> {
             return Ok(None);
         }
         let authored = self.snapshot.component::<Geometry>(entity)?;
-        let placement = if let Some(placement) = self.balloon_flows.get(&entity) {
+        let typography = self.snapshot.component::<Typography>(entity)?;
+        let original_text = typography.as_ref().and_then(|value| value.placement)
+            == Some(TextPlacement::OriginalText);
+        let source_placement = if original_text {
+            self.source_text_placement(content, dependencies)?
+        } else {
+            None
+        };
+        let placement = if let Some(placement) = source_placement {
+            Some(placement)
+        } else if let Some(placement) = self.balloon_flows.get(&entity) {
             dependencies.extend(placement.dependencies.iter().cloned());
             Some(placement.clone())
         } else if let Some(placement) = self.balloon_flow(entity, dependencies)? {
@@ -765,7 +775,6 @@ impl Traversal<'_> {
                 placement.balloon_contour,
             )
         };
-        let typography = self.snapshot.component::<Typography>(entity)?;
         let analysis =
             if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
                 dependencies.insert(RenderDependency::Relation(recognized.id()));
@@ -818,6 +827,11 @@ impl Traversal<'_> {
                 .and_then(|value| value.color)
                 .unwrap_or([0, 0, 0, 255]),
             stroke: resolve_stroke(typography.as_ref()),
+            shear_x: typography.as_ref().and_then(|value| value.shear_x),
+            shear_y: typography.as_ref().and_then(|value| value.shear_y),
+            shadow: typography.as_ref().and_then(|value| value.shadow.clone()),
+            glow: typography.as_ref().and_then(|value| value.glow.clone()),
+            gradient: typography.as_ref().and_then(|value| value.gradient.clone()),
             line_height: 1.2,
             letter_spacing: 0.0,
             word_spacing: 0.0,
@@ -848,6 +862,33 @@ impl Traversal<'_> {
         dependencies: &mut BTreeSet<RenderDependency>,
     ) -> Result<Option<ResolvedPlacement>> {
         let Some(relation) = self.snapshot.relation_from::<FitsTo>(entity)? else {
+            return Ok(None);
+        };
+        let target = relation.value().target;
+        if !belongs_to_page(self.snapshot, target, self.page)? {
+            return Ok(None);
+        }
+        dependencies.insert(RenderDependency::Relation(relation.id()));
+        dependencies.insert(RenderDependency::Entity(target));
+        dependencies.insert(component_dependency::<Geometry>(target));
+        let geometry = self.snapshot.analysis_region(target)?.geometry()?;
+        let Some(frame) = geometry_frame(&geometry, None) else {
+            return Ok(None);
+        };
+        Ok(Some(ResolvedPlacement {
+            geometry,
+            frame,
+            balloon_contour: None,
+            dependencies: Arc::from([]),
+        }))
+    }
+
+    fn source_text_placement(
+        &self,
+        content: EntityId,
+        dependencies: &mut BTreeSet<RenderDependency>,
+    ) -> Result<Option<ResolvedPlacement>> {
+        let Some(relation) = self.snapshot.relation_from::<RecognizedFrom>(content)? else {
             return Ok(None);
         };
         let target = relation.value().target;
@@ -1721,6 +1762,12 @@ mod tests {
             stroke_width: None,
             alignment: None,
             writing_mode: Some(koharu_scene::WritingMode::Vertical),
+            placement: None,
+            shear_x: None,
+            shear_y: None,
+            shadow: None,
+            glow: None,
+            gradient: None,
             extensions: BTreeMap::new(),
         };
         let bounds = LayoutBox {
@@ -1757,6 +1804,12 @@ mod tests {
             stroke_width: None,
             alignment: None,
             writing_mode: Some(koharu_scene::WritingMode::Vertical),
+            placement: None,
+            shear_x: None,
+            shear_y: None,
+            shadow: None,
+            glow: None,
+            gradient: None,
             extensions: BTreeMap::new(),
         };
         let bounds = LayoutBox {
@@ -2206,16 +2259,78 @@ mod tests {
             .unwrap();
         let reset = session.commit(reset).await.unwrap();
         let restored = renderer.render(&reset.snapshot, page).await.unwrap();
-        for entity in layers {
+        for entity in &layers {
             assert_eq!(
-                restored.layer(entity).unwrap().geometry(),
-                original.layer(entity).unwrap().geometry()
+                restored.layer(*entity).unwrap().geometry(),
+                original.layer(*entity).unwrap().geometry()
             );
             assert_eq!(
-                restored.layer(entity).unwrap().kind(),
-                original.layer(entity).unwrap().kind()
+                restored.layer(*entity).unwrap().kind(),
+                original.layer(*entity).unwrap().kind()
             );
         }
+
+        let source_region = reset
+            .snapshot
+            .relation_from::<RecognizedFrom>(
+                reset
+                    .snapshot
+                    .relation_from::<Presents>(layers[0])
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .target,
+            )
+            .unwrap()
+            .unwrap()
+            .value()
+            .target;
+        let use_original = reset
+            .snapshot
+            .patch(|edit| {
+                let mut typography = reset
+                    .snapshot
+                    .component::<Typography>(layers[0])?
+                    .unwrap_or_else(|| Typography {
+                        origin: Origin::User,
+                        preferred_font: None,
+                        font_weight: None,
+                        font_style: None,
+                        size: None,
+                        auto_fit: true,
+                        color: None,
+                        stroke_color: None,
+                        stroke_width: None,
+                        alignment: None,
+                        writing_mode: None,
+                        placement: None,
+                        shear_x: None,
+                        shear_y: None,
+                        shadow: None,
+                        glow: None,
+                        gradient: None,
+                        extensions: Default::default(),
+                    });
+                typography.placement = Some(koharu_scene::TextPlacement::OriginalText);
+                edit.set(layers[0], &typography)
+            })
+            .unwrap();
+        let with_original = session.commit(use_original).await.unwrap();
+        let original_compiled = renderer.compile(&with_original.snapshot, page).unwrap();
+        let first = original_compiled
+            .layers
+            .iter()
+            .find(|layer| layer.entity == layers[0])
+            .unwrap();
+        assert_eq!(
+            first.geometry,
+            with_original
+                .snapshot
+                .analysis_region(source_region)
+                .unwrap()
+                .geometry()
+                .unwrap()
+        );
     }
 
     #[tokio::test]

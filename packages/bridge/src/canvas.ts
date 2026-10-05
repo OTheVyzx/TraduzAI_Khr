@@ -11,6 +11,7 @@ export interface CanvasStroke {
   layer: string | null
   point: Point
   diameter: number
+  hardness: number
   color?: CanvasColor
 }
 
@@ -25,8 +26,8 @@ export interface Canvas {
   cacheFrame(token: number, page: string): boolean
   clear(): void
   previewOpacity(element: string, opacity: number | null): void
-  beginTransform(elements: TransformFrame[]): void
-  updateTransform(elements: TransformFrame[]): void
+  beginTransform(elements: TransformFrame[], shear?: CanvasShear): void
+  updateTransform(elements: TransformFrame[], shear?: CanvasShear): void
   finishTransform(): void
   cancelTransform(): void
   beginStroke(stroke: CanvasStroke): void
@@ -45,7 +46,14 @@ interface CanvasTransformFrame {
     width: number
     height: number
     angleDegrees: number
+    shearX?: number
+    shearY?: number
   }
+}
+
+interface CanvasShear {
+  x: number
+  y: number
 }
 
 interface CanvasHandle {
@@ -67,6 +75,7 @@ interface CanvasHandle {
     layer: string | null,
     point: Point,
     diameter: number,
+    hardness: number,
     color: Uint8Array,
   ): void
   extendStroke(points: Point[]): void
@@ -140,12 +149,12 @@ export async function createCanvas(
       cachedManifests.clear()
     },
     previewOpacity: (element, opacity) => canvas.previewOpacity(element, opacity),
-    beginTransform: (elements) => {
+    beginTransform: (elements, shear) => {
       transformSequence = 0
-      canvas.beginTransform(canvasTransformFrames(elements))
+      canvas.beginTransform(canvasTransformFrames(elements, shear))
     },
-    updateTransform: (elements) =>
-      canvas.updateTransform(++transformSequence, canvasTransformFrames(elements)),
+    updateTransform: (elements, shear) =>
+      canvas.updateTransform(++transformSequence, canvasTransformFrames(elements, shear)),
     finishTransform: () => void canvas.finishTransform(),
     cancelTransform: () => canvas.cancelTransform(),
     beginStroke: (stroke) =>
@@ -154,6 +163,7 @@ export async function createCanvas(
         stroke.layer,
         stroke.point,
         stroke.diameter,
+        stroke.hardness,
         new Uint8Array(stroke.color ?? [0, 0, 0, 0]),
       ),
     extendStroke: (points) => canvas.extendStroke(points),
@@ -289,7 +299,10 @@ export function workspaceColor(): WorkspaceColor {
   return values.map((value) => Math.min(255, Math.max(0, Math.round(value)))) as WorkspaceColor
 }
 
-function canvasTransformFrames(elements: TransformFrame[]): CanvasTransformFrame[] {
+function canvasTransformFrames(
+  elements: TransformFrame[],
+  shear?: CanvasShear,
+): CanvasTransformFrame[] {
   return elements.map(({ element, frame }) => ({
     element,
     frame: {
@@ -298,6 +311,7 @@ function canvasTransformFrames(elements: TransformFrame[]): CanvasTransformFrame
       width: frame.width,
       height: frame.height,
       angleDegrees: frame.angle_degrees,
+      ...(shear === undefined ? {} : { shearX: shear.x, shearY: shear.y }),
     },
   }))
 }

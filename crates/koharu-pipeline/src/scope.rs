@@ -57,6 +57,7 @@ pub enum Scope {
         bounds: Bounds,
     },
     Entities(Vec<EntityId>),
+    Untranslated(EntityId),
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +133,38 @@ impl NormalizedScope {
                     .collect::<Arc<[_]>>();
                 Ok(Self {
                     pages,
+                    entities: Some(Arc::new(entities)),
+                    region: None,
+                })
+            }
+            Scope::Untranslated(page) => {
+                if stages != [Stage::Translation] {
+                    bail!("untranslated scope only supports translation");
+                }
+                let Some(group) = snapshot.page(*page)?.text_group()? else {
+                    bail!("page has no untranslated text");
+                };
+                let mut entities = BTreeSet::new();
+                for layer in group.text_layers()? {
+                    let content = layer.content()?;
+                    let Some(source) = content.source()? else {
+                        continue;
+                    };
+                    if source.text.value.trim().is_empty() {
+                        continue;
+                    }
+                    if content
+                        .translation()?
+                        .is_none_or(|translation| translation.text.value.trim().is_empty())
+                    {
+                        entities.insert(layer.id());
+                    }
+                }
+                if entities.is_empty() {
+                    bail!("page has no untranslated text");
+                }
+                Ok(Self {
+                    pages: Arc::from([*page]),
                     entities: Some(Arc::new(entities)),
                     region: None,
                 })

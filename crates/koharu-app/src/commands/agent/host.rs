@@ -362,6 +362,12 @@ impl Host for KoharuHost {
                     stroke_width: arguments.stroke_width,
                     alignment: arguments.alignment.map(Into::into),
                     writing_mode: arguments.writing_mode.map(Into::into),
+                    placement: None,
+                    shear_x: None,
+                    shear_y: None,
+                    shadow: None,
+                    glow: None,
+                    gradient: None,
                 };
                 self.mutate(|project| {
                     Box::pin(async move {

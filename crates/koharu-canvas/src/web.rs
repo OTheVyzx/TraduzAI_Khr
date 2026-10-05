@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use vello::{
     AaSupport, RendererOptions, Scene,
     kurbo::{Affine, BezPath, Circle, Rect, Stroke},
-    peniko::{Color, Fill, Mix},
+    peniko::{Color, Fill, Gradient, Mix},
     wgpu,
 };
 use wasm_bindgen::{JsCast as _, prelude::*};
@@ -71,13 +71,25 @@ struct ElementFrame {
     height: f32,
     #[serde(default)]
     angle_degrees: f32,
+    #[serde(default)]
+    shear_x: f32,
+    #[serde(default)]
+    shear_y: f32,
 }
 
 impl ElementFrame {
     fn is_valid(self) -> bool {
-        [self.x, self.y, self.width, self.height, self.angle_degrees]
-            .into_iter()
-            .all(f32::is_finite)
+        [
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.angle_degrees,
+            self.shear_x,
+            self.shear_y,
+        ]
+        .into_iter()
+        .all(f32::is_finite)
             && self.width > 0.0
             && self.height > 0.0
     }
@@ -113,6 +125,7 @@ enum StrokeCommitDto {
         revision: u64,
         layer: Option<String>,
         diameter: f32,
+        hardness: f32,
         color: [u8; 4],
         points: Vec<Point>,
     },
@@ -121,6 +134,7 @@ enum StrokeCommitDto {
         revision: u64,
         layer: String,
         diameter: f32,
+        hardness: f32,
         points: Vec<Point>,
     },
     Inpaint {
@@ -205,6 +219,7 @@ struct StrokeEdit {
     kind: StrokeKind,
     layer: Option<LayerId>,
     diameter: f32,
+    hardness: f32,
     color: [u8; 4],
     points: Vec<Point>,
     preview: Scene,
@@ -1409,6 +1424,8 @@ impl WebCanvas {
                 width: control.width,
                 height: control.height,
                 angle_degrees: control.angle_degrees,
+                shear_x: element.frame.shear_x,
+                shear_y: element.frame.shear_y,
             };
             order.push(id);
             originals.insert(id, control);
@@ -1515,10 +1532,12 @@ impl WebCanvas {
         layer: Option<String>,
         point: JsValue,
         diameter: f32,
+        hardness: f32,
         color: &Uint8Array,
     ) -> Result<(), JsValue> {
         let point: Point = serde_wasm_bindgen::from_value(point).map_err(js_error)?;
         validate_brush(diameter)?;
+        validate_hardness(hardness)?;
         let color = rgba(color)?;
         let mut browser = self.browser_mut()?;
         if browser.canvas.stroke.is_some() || browser.canvas.transform.is_some() {
@@ -1535,6 +1554,11 @@ impl WebCanvas {
             "erase" => StrokeKind::Erase,
             "inpaint" => StrokeKind::Inpaint,
             _ => return Err(js_message("unknown canvas stroke kind")),
+        };
+        let hardness = if kind == StrokeKind::Inpaint {
+            100.0
+        } else {
+            hardness
         };
         let layer = layer.as_deref().map(parse_layer_id).transpose()?;
         if kind == StrokeKind::Erase {
@@ -1563,13 +1587,14 @@ impl WebCanvas {
             StrokeKind::Paint => [color[0], color[1], color[2], 255],
         };
         let mut preview = Scene::new();
-        draw_dot(&mut preview, point, diameter, preview_color);
+        draw_dot(&mut preview, point, diameter, hardness, preview_color);
         browser.canvas.stroke = Some(StrokeEdit {
             page: frame.page(),
             revision: frame.revision(),
             kind,
             layer,
             diameter,
+            hardness,
             color,
             points: vec![point],
             preview,
@@ -1599,6 +1624,9 @@ impl WebCanvas {
         if stroke.pending {
             return Err(js_message("stroke is waiting for its replacement frame"));
         }
+        if stroke.hardness < 100.0 && stroke.points.len() == 1 && !points.is_empty() {
+            stroke.preview = Scene::new();
+        }
         let mut changed = false;
         for point in points {
             if !point.x.is_finite() || !point.y.is_finite() {
@@ -1622,6 +1650,7 @@ impl WebCanvas {
                 previous,
                 point,
                 stroke.diameter,
+                stroke.hardness,
                 preview_color,
             );
             stroke.points.push(point);
@@ -1652,6 +1681,7 @@ impl WebCanvas {
                 revision,
                 layer: stroke.layer.map(format_layer_id),
                 diameter: stroke.diameter,
+                hardness: stroke.hardness,
                 color: stroke.color,
                 points: stroke.points.clone(),
             },
@@ -1660,6 +1690,7 @@ impl WebCanvas {
                 revision,
                 layer: format_layer_id(stroke.layer.expect("erase target validated")),
                 diameter: stroke.diameter,
+                hardness: stroke.hardness,
                 points: stroke.points.clone(),
             },
             StrokeKind::Inpaint => StrokeCommitDto::Inpaint {
@@ -1804,22 +1835,110 @@ fn page_clip(camera: Camera, page: (u32, u32), viewport: PhysicalSize) -> [u32; 
     ]
 }
 
-fn draw_dot(scene: &mut Scene, point: Point, diameter: f32, color: [u8; 4]) {
+fn draw_dot(scene: &mut Scene, point: Point, diameter: f32, hardness: f32, color: [u8; 4]) {
     let color = Color::from_rgba8(color[0], color[1], color[2], color[3]);
+    let radius = f64::from(diameter) * 0.5;
+    if hardness >= 100.0 {
+        scene.fill(
+            Fill::NonZero,
+            Affine::IDENTITY,
+            color,
+            None,
+            &Circle::new((point.x, point.y), radius),
+        );
+        return;
+    }
+
+    let gradient_radius = radius + 0.5;
+    let stops = brush_gradient_stops(color, radius, hardness, |offset| {
+        f64::from(offset) * gradient_radius
+    });
+    let gradient = Gradient::new_radial((point.x, point.y), gradient_radius as f32)
+        .with_stops(stops.as_slice());
     scene.fill(
         Fill::NonZero,
         Affine::IDENTITY,
-        color,
+        &gradient,
         None,
-        &Circle::new((point.x, point.y), f64::from(diameter) * 0.5),
+        &Circle::new((point.x, point.y), gradient_radius),
     );
 }
 
-fn draw_segment(scene: &mut Scene, from: Point, to: Point, diameter: f32, color: [u8; 4]) {
-    let color = Color::from_rgba8(color[0], color[1], color[2], color[3]);
+fn draw_segment(
+    scene: &mut Scene,
+    from: Point,
+    to: Point,
+    diameter: f32,
+    hardness: f32,
+    color: [u8; 4],
+) {
+    let color_bytes = color;
+    let color = Color::from_rgba8(
+        color_bytes[0],
+        color_bytes[1],
+        color_bytes[2],
+        color_bytes[3],
+    );
     let mut path = BezPath::new();
     path.move_to((from.x, from.y));
     path.line_to((to.x, to.y));
+
+    if hardness < 100.0 {
+        let dx = to.x - from.x;
+        let dy = to.y - from.y;
+        let length = dx.hypot(dy);
+        if length <= f64::EPSILON {
+            draw_dot(scene, to, diameter, hardness, color_bytes);
+            return;
+        }
+        let normal_x = -dy / length;
+        let normal_y = dx / length;
+        let midpoint = Point {
+            x: (from.x + to.x) * 0.5,
+            y: (from.y + to.y) * 0.5,
+        };
+        let gradient_radius = f64::from(diameter) * 0.5 + 0.5;
+        let gradient_start = (
+            midpoint.x - normal_x * gradient_radius,
+            midpoint.y - normal_y * gradient_radius,
+        );
+        let gradient_end = (
+            midpoint.x + normal_x * gradient_radius,
+            midpoint.y + normal_y * gradient_radius,
+        );
+        let stops = brush_gradient_stops(color, f64::from(diameter) * 0.5, hardness, |offset| {
+            f64::from((offset * 2.0 - 1.0).abs()) * gradient_radius
+        });
+        let gradient =
+            Gradient::new_linear(gradient_start, gradient_end).with_stops(stops.as_slice());
+        scene.stroke(
+            &Stroke::new(f64::from(diameter) + 1.0),
+            Affine::IDENTITY,
+            &gradient,
+            None,
+            &path,
+        );
+        let tangent_x = dx / length;
+        let tangent_y = dy / length;
+        draw_gradient_cap(
+            scene,
+            from,
+            (-tangent_x, -tangent_y),
+            diameter,
+            hardness,
+            color_bytes,
+        );
+        draw_gradient_cap(
+            scene,
+            to,
+            (tangent_x, tangent_y),
+            diameter,
+            hardness,
+            color_bytes,
+        );
+        return;
+    }
+
     scene.stroke(
         &Stroke::new(f64::from(diameter)),
         Affine::IDENTITY,
@@ -1834,6 +1953,68 @@ fn draw_segment(scene: &mut Scene, from: Point, to: Point, diameter: f32, color:
         None,
         &Circle::new((to.x, to.y), f64::from(diameter) * 0.5),
     );
+}
+
+fn draw_gradient_cap(
+    scene: &mut Scene,
+    point: Point,
+    tangent: (f64, f64),
+    diameter: f32,
+    hardness: f32,
+    color: [u8; 4],
+) {
+    let gradient_radius = f64::from(diameter) * 0.5 + 0.5;
+    let normal = (-tangent.1, tangent.0);
+    let transform = Affine::new([tangent.0, tangent.1, normal.0, normal.1, point.x, point.y]);
+    let clip = Rect::new(0.0, -gradient_radius, gradient_radius, gradient_radius);
+    scene.push_clip_layer(Fill::NonZero, transform, &clip);
+    draw_dot(scene, point, diameter, hardness, color);
+    scene.pop_layer();
+}
+
+fn brush_gradient_stops(
+    color: Color,
+    radius: f64,
+    hardness: f32,
+    distance_at: impl Fn(f32) -> f64,
+) -> Vec<(f32, Color)> {
+    const STEPS: usize = 32;
+    (0..=STEPS)
+        .map(|step| {
+            let offset = step as f32 / STEPS as f32;
+            let alpha = stroke_coverage(radius, distance_at(offset), hardness);
+            (offset, color.multiply_alpha(alpha))
+        })
+        .collect()
+}
+
+fn stroke_coverage(radius: f64, distance: f64, hardness: f32) -> f32 {
+    if hardness >= 100.0 {
+        return (radius + 0.5 - distance).clamp(0.0, 1.0) as f32;
+    }
+
+    let hardness = f64::from(hardness.clamp(0.0, 100.0) / 100.0);
+    let solid_radius = (radius - 0.5).max(0.0) * hardness;
+    let outer_radius = radius + 0.5;
+    if distance <= solid_radius {
+        return 1.0;
+    }
+    if distance >= outer_radius {
+        return 0.0;
+    }
+
+    let progress = ((distance - solid_radius) / (outer_radius - solid_radius)).clamp(0.0, 1.0);
+    let hard_profile = 1.0 - progress;
+    let smooth_profile = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+    (hard_profile * hardness + smooth_profile * (1.0 - hardness)) as f32
+}
+
+fn validate_hardness(hardness: f32) -> Result<(), JsValue> {
+    if hardness.is_finite() && (0.0..=100.0).contains(&hardness) {
+        Ok(())
+    } else {
+        Err(js_message("brush hardness must be between 0 and 100"))
+    }
 }
 
 fn frame_transform(original: ElementFrame, preview: ElementFrame) -> Affine {
@@ -1851,14 +2032,26 @@ fn frame_transform(original: ElementFrame, preview: ElementFrame) -> Affine {
     let original_center_y = f64::from(original.y + original.height * 0.5);
     let preview_center_x = f64::from(preview.x + preview.width * 0.5);
     let preview_center_y = f64::from(preview.y + preview.height * 0.5);
-    Affine::new([
+    let base = Affine::new([
         a,
         b,
         c,
         d,
         preview_center_x - a * original_center_x - c * original_center_y,
         preview_center_y - b * original_center_x - d * original_center_y,
-    ])
+    ]);
+    if preview.shear_x == original.shear_x && preview.shear_y == original.shear_y {
+        base
+    } else {
+        let correction = Affine::skew(f64::from(preview.shear_x), 0.0)
+            * Affine::skew(0.0, f64::from(preview.shear_y))
+            * Affine::skew(0.0, -f64::from(original.shear_y))
+            * Affine::skew(-f64::from(original.shear_x), 0.0);
+        Affine::translate((preview_center_x, preview_center_y))
+            * correction
+            * Affine::translate((-preview_center_x, -preview_center_y))
+            * base
+    }
 }
 
 fn parse_layer_id(value: &str) -> Result<LayerId, JsValue> {

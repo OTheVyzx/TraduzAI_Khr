@@ -136,6 +136,8 @@
     "providerDefault": "Provider default",
     "run": "Run",
     "runProcessing": "Run processing",
+    "translateMissing": "Translate pending: {{count}}",
+    "fillMissing": "Fill pending: {{count}}",
     "scope": "Scope",
     "scopeShort": {
       "page": "Page",
@@ -390,6 +392,12 @@
         "textThreshold": "Text threshold"
       },
       "processing": "Processing",
+      "parallelism": "Parallelism",
+      "workers": {
+        "description": "Limits how many pages are active in the current stage. GPU model inference remains serialized to control VRAM use.",
+        "label": "Active pages",
+        "title": "Page workers"
+      },
       "stages": {
         "detection": {
           "description": "Find text, speech bubbles, and panels.",
@@ -503,9 +511,13 @@
     "draw": "Brush",
     "eraser": "Eraser",
     "increaseBrushSize": "Increase brush size",
+    "inpaint_region": "Inpaint inside polygon",
+    "ocr_region": "Recognize text in area",
     "pan": "Pan",
     "remove": "Remove",
+    "restore_region": "Restore original in area",
     "select": "Select",
+    "snap_to_center": "Snap text to image center",
     "text": "Text"
   },
   "updater": {

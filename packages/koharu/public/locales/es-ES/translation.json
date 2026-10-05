@@ -136,6 +136,8 @@
     "providerDefault": "Predeterminado del proveedor",
     "run": "Ejecutar",
     "runProcessing": "Ejecutar procesamiento",
+    "translateMissing": "Traducir pendientes: {{count}}",
+    "fillMissing": "Rellenar pendientes: {{count}}",
     "scope": "Ámbito",
     "scopeShort": {
       "page": "Página",
@@ -390,6 +392,12 @@
         "textThreshold": "Umbral de texto"
       },
       "processing": "Procesando",
+      "parallelism": "Paralelismo",
+      "workers": {
+        "description": "Limita cuántas páginas están activas en la etapa actual. La inferencia GPU sigue serializada para controlar el uso de VRAM.",
+        "label": "Páginas activas",
+        "title": "Trabajadores de página"
+      },
       "stages": {
         "detection": {
           "description": "Encuentra texto, bocadillos y viñetas.",
@@ -503,9 +511,13 @@
     "draw": "Dibujar",
     "eraser": "Borrador",
     "increaseBrushSize": "Aumentar tamaño del pincel",
+    "inpaint_region": "Rellenar dentro del polígono",
+    "ocr_region": "Reconocer texto en el área",
     "pan": "Desplazar",
     "remove": "Eliminar",
+    "restore_region": "Restaurar imagen original en el área",
     "select": "Seleccionar",
+    "snap_to_center": "Ajustar texto al centro de la imagen",
     "text": "Texto"
   },
   "updater": {

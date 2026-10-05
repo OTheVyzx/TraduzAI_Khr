@@ -14,6 +14,8 @@ import {
 export type CanvasStatus = 'loading' | 'switching' | 'ready' | 'recovering' | 'error'
 
 interface CanvasState {
+  activePage: string | null
+  activeRevision: number | null
   canvas: Canvas | null
   error: Error | null
   generation: number | null
@@ -26,6 +28,7 @@ export function useCanvas(
   element: HTMLCanvasElement | null,
   revision: number | null,
   generation: number,
+  page: string | null = null,
 ): CanvasState {
   const [canvasAttempt, setCanvasAttempt] = useState(0)
   const [loadAttempt, setLoadAttempt] = useState(0)
@@ -33,10 +36,13 @@ export function useCanvas(
   const [status, setStatus] = useState<CanvasStatus>('loading')
   const [error, setError] = useState<Error | null>(null)
   const [activeGeneration, setActiveGeneration] = useState<number | null>(null)
+  const [activePage, setActivePage] = useState<string | null>(null)
+  const [activeRevision, setActiveRevision] = useState<number | null>(null)
   const [hasFrame, setHasFrame] = useState(false)
   const hasFrameRef = useRef(false)
   const generationRef = useRef(generation)
   const revisionRef = useRef(revision)
+  const pageRef = useRef(page)
   const activeFrame = useRef<{
     canvas: Canvas
     generation: number
@@ -44,6 +50,7 @@ export function useCanvas(
   const request = useRef<object | null>(null)
   generationRef.current = generation
   revisionRef.current = revision
+  pageRef.current = page
 
   const updateHasFrame = useCallback((value: boolean) => {
     hasFrameRef.current = value
@@ -62,6 +69,8 @@ export function useCanvas(
     setCanvas(null)
     setError(null)
     setActiveGeneration(null)
+    setActivePage(null)
+    setActiveRevision(null)
     updateHasFrame(false)
     setStatus(canvasAttempt === 0 ? 'loading' : 'recovering')
 
@@ -107,6 +116,8 @@ export function useCanvas(
         canvas.clear()
         activeFrame.current = { canvas, generation }
         setActiveGeneration(generation)
+        setActivePage(null)
+        setActiveRevision(null)
         updateHasFrame(false)
         setError(null)
         setStatus('ready')
@@ -123,6 +134,8 @@ export function useCanvas(
       return
 
     const requested = generation
+    const requestedRevision = revision
+    const requestedPage = page
     cancelCanvasPrefetch()
     const currentRequest = {}
     request.current = currentRequest
@@ -134,13 +147,16 @@ export function useCanvas(
     const current = () =>
       request.current === currentRequest &&
       generationRef.current === requested &&
-      revisionRef.current !== null
+      revisionRef.current === requestedRevision &&
+      pageRef.current === requestedPage
 
     void prepareFrame(canvas, requested, current)
       .then((activated) => {
         if (!current() || !activated) return
         activeFrame.current = { canvas, generation: requested }
         setActiveGeneration(requested)
+        setActivePage(requestedPage)
+        setActiveRevision(requestedRevision)
         request.current = null
         updateHasFrame(true)
         setError(null)
@@ -152,14 +168,23 @@ export function useCanvas(
         setError(toError(reason))
         setStatus('error')
       })
-  }, [canvas, generation, loadAttempt, revision, updateHasFrame])
+  }, [canvas, generation, loadAttempt, page, revision, updateHasFrame])
 
   useEffect(() => {
     if (!canvas) return
     return activateCanvas(canvas)
   }, [canvas])
 
-  return { canvas, error, generation: activeGeneration, hasFrame, retry, status }
+  return {
+    activePage,
+    activeRevision,
+    canvas,
+    error,
+    generation: activeGeneration,
+    hasFrame,
+    retry,
+    status,
+  }
 }
 
 async function prepareFrame(

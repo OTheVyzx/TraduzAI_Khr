@@ -11,7 +11,7 @@ use crate::{Error, Result};
 
 const MANIFEST_MAGIC: [u8; 8] = *b"KHRMANF\0";
 const RESOURCE_MAGIC: [u8; 8] = *b"KHRRSRC\0";
-pub const PREPARED_FRAME_MANIFEST_VERSION: u16 = 4;
+pub const PREPARED_FRAME_MANIFEST_VERSION: u16 = 5;
 pub const PREPARED_RESOURCE_FORMAT_VERSION: u16 = 3;
 /// Logical raster tile edge used by portable frames. The one-pixel sampling
 /// gutter is stored outside this logical extent where adjacent pixels exist.
@@ -651,7 +651,16 @@ pub struct PreparedGlyphRun {
     pub hint: bool,
     pub embolden: [f32; 2],
     pub color: [u8; 4],
+    pub gradient: Option<PreparedLinearGradient>,
     pub glyphs: Vec<PreparedGlyph>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PreparedLinearGradient {
+    pub start: [f32; 2],
+    pub end: [f32; 2],
+    pub start_color: [u8; 4],
+    pub end_color: [u8; 4],
 }
 
 impl PreparedGlyphRun {
@@ -676,6 +685,16 @@ impl PreparedGlyphRun {
             .any(|glyph| !glyph.x.is_finite() || !glyph.y.is_finite())
         {
             return Err(Error::invalid("glyph run contains a non-finite position"));
+        }
+        if self.gradient.as_ref().is_some_and(|gradient| {
+            gradient
+                .start
+                .iter()
+                .chain(gradient.end.iter())
+                .any(|coordinate| !coordinate.is_finite())
+                || gradient.start == gradient.end
+        }) {
+            return Err(Error::invalid("glyph gradient is invalid"));
         }
         Ok(())
     }

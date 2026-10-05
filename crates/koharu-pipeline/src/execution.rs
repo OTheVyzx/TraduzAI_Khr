@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use anyhow::{Context as _, Result, ensure};
 use futures::{StreamExt as _, stream::FuturesUnordered};
@@ -30,7 +26,6 @@ pub(crate) struct Execution<'a> {
     scheduler: Scheduler,
     scene: Snapshot,
     images: BTreeMap<EntityId, Arc<ImageCache>>,
-    busy_stages: BTreeSet<Stage>,
     completed: usize,
     failure: Option<PipelineError>,
     base: koharu_scene::Revision,
@@ -48,6 +43,7 @@ impl<'a> Execution<'a> {
     ) -> std::result::Result<Self, PipelineError> {
         let started = Instant::now();
         let base = snapshot.revision();
+        let page_workers = runner.page_workers();
         let stages = request
             .operation
             .stages()
@@ -79,10 +75,9 @@ impl<'a> Execution<'a> {
             stop: request.stop,
             progress: request.progress,
             scope,
-            scheduler: Scheduler::new(&pages, &stages),
+            scheduler: Scheduler::new(&pages, &stages, page_workers),
             scene: snapshot,
             images: BTreeMap::new(),
-            busy_stages: BTreeSet::new(),
             completed: 0,
             failure: None,
             base,
@@ -103,13 +98,24 @@ impl<'a> Execution<'a> {
         let mut running = FuturesUnordered::new();
         loop {
             while let Some(job) = self.take_ready_job() {
-                running.push(runner.run(job));
+                let runner = runner.clone();
+                running.push(tokio::spawn(async move { runner.run(job).await }));
             }
 
             let Some(completion) = running.next().await else {
                 break;
             };
-            self.busy_stages.remove(&completion.stage);
+            let completion = match completion {
+                Ok(completion) => completion,
+                Err(error) => {
+                    self.failure = Some(PipelineError::new(
+                        ErrorKind::Processing,
+                        None,
+                        anyhow::anyhow!("pipeline worker task failed: {error}"),
+                    ));
+                    continue;
+                }
+            };
             if self.stopped() || self.failure.is_some() {
                 continue;
             }
@@ -125,8 +131,7 @@ impl<'a> Execution<'a> {
         if self.stopped() || self.failure.is_some() {
             return None;
         }
-        let (page, stage) = self.scheduler.start_next(&self.busy_stages)?;
-        self.busy_stages.insert(stage);
+        let (page, stage) = self.scheduler.start_next()?;
         let images = self
             .images
             .entry(page)
@@ -217,9 +222,10 @@ impl<'a> Execution<'a> {
     }
 
     fn mark_complete(&mut self, page: EntityId, stage: Stage) {
-        if self.scheduler.complete_stage(page, stage) {
-            self.images.remove(&page);
-        }
+        self.scheduler.complete_stage(page, stage);
+        // Keep decoded source pages bounded by the active worker count instead
+        // of retaining the entire chapter between stage barriers.
+        self.images.remove(&page);
         self.completed += 1;
     }
 

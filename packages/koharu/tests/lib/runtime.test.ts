@@ -26,6 +26,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 const preferences: Preferences = {
   pipeline: {
+    page_workers: 4,
     detection: { model: 'koharu-layout-rfdetr-seg-2xl' },
     ocr: { model: 'paddleocr-vl-1.6' },
     translation: {
@@ -73,6 +74,7 @@ const startupState = (): StartupState => ({
     generation: 0,
     size: [0, 0],
     element_frames: [],
+    element_font_sizes: [],
   },
 })
 

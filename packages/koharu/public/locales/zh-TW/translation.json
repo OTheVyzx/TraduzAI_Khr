@@ -136,6 +136,8 @@
     "providerDefault": "提供者預設值",
     "run": "執行",
     "runProcessing": "執行處理",
+    "translateMissing": "翻譯未翻譯文字：{{count}}",
+    "fillMissing": "填入待處理項：{{count}}",
     "scope": "範圍",
     "scopeShort": {
       "page": "頁面",
@@ -390,6 +392,12 @@
         "textThreshold": "文字閾值"
       },
       "processing": "正在處理",
+      "parallelism": "平行處理",
+      "workers": {
+        "description": "限制目前階段同時處理的頁面數。為控制 VRAM 使用量，GPU 模型推論仍會依序執行。",
+        "label": "作用中頁面",
+        "title": "頁面工作者"
+      },
       "stages": {
         "detection": {
           "description": "尋找文字、對話框和分鏡。",
@@ -503,9 +511,13 @@
     "draw": "繪圖",
     "eraser": "橡皮擦",
     "increaseBrushSize": "增加筆刷大小",
+    "inpaint_region": "修補多邊形區域",
+    "ocr_region": "辨識區域中的文字",
     "pan": "平移",
     "remove": "移除",
+    "restore_region": "還原區域中的原始影像",
     "select": "選取",
+    "snap_to_center": "將文字吸附至影像中央",
     "text": "文字"
   },
   "updater": {

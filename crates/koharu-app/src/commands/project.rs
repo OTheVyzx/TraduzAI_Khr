@@ -4,12 +4,13 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use koharu_desktop::Frame;
 use koharu_scene::{
-    AssetInput, AssetMetadata, AssetRole, At, Authored, Commit, EntityId, EntityOrigin,
+    AssetInput, AssetMetadata, AssetRole, At, Authored, Commit, EntityId, EntityOrigin, FitsTo,
     Geometry as SceneGeometry, Group as SceneGroup, Origin, PageDraft, Point as ScenePoint,
-    Presents, RasterLayer as SceneRasterLayer, RasterLayerKind, Region as SceneRegion,
-    RemovePolicy, Revision, Session, Snapshot, SourceText as SceneSourceText,
-    TextGroup as SceneTextGroup, TextLayout as SceneTextLayout, TextLayoutKind,
-    Translation as SceneTranslation, Typography as SceneTypography, Visibility as SceneVisibility,
+    Presents, RasterLayer as SceneRasterLayer, RasterLayerKind, RecognizedFrom,
+    Region as SceneRegion, RemovePolicy, Revision, Session, Snapshot,
+    SourceText as SceneSourceText, TextGroup as SceneTextGroup, TextLayout as SceneTextLayout,
+    TextLayoutKind, TextRegion, Translation as SceneTranslation, Typography as SceneTypography,
+    Visibility as SceneVisibility,
 };
 use serde::Serialize;
 use specta::Type;
@@ -169,6 +170,12 @@ pub struct Typography {
     pub stroke_width: Option<f32>,
     pub alignment: Option<koharu_scene::TextAlignment>,
     pub writing_mode: Option<koharu_scene::WritingMode>,
+    pub placement: Option<koharu_scene::TextPlacement>,
+    pub shear_x: Option<f32>,
+    pub shear_y: Option<f32>,
+    pub shadow: Option<koharu_scene::TextShadow>,
+    pub glow: Option<koharu_scene::TextGlow>,
+    pub gradient: Option<koharu_scene::TextGradient>,
 }
 
 pub(crate) struct CurrentProject {
@@ -182,9 +189,12 @@ pub(crate) struct ProjectLibrary {
 
 impl ProjectLibrary {
     pub(crate) fn new() -> Result<Self> {
-        let root = dirs::document_dir()
-            .context("the Documents directory is unavailable")?
-            .join("Koharu");
+        let root = match koharu_config::data_directory()? {
+            Some(directory) => directory.join("projects"),
+            None => dirs::document_dir()
+                .context("the Documents directory is unavailable")?
+                .join("Koharu"),
+        };
         std::fs::create_dir_all(&root)
             .with_context(|| format!("failed to create {}", root.display()))?;
         Ok(Self { root })
@@ -461,6 +471,12 @@ impl Project {
                         TextLayoutKind::Paragraph => None,
                     },
                     writing_mode: None,
+                    placement: None,
+                    shear_x: None,
+                    shear_y: None,
+                    shadow: None,
+                    glow: None,
+                    gradient: None,
                     extensions: Default::default(),
                 },
             )?;
@@ -470,6 +486,101 @@ impl Project {
             self.commit(patch).await?,
             layer.expect("text layer was added while building the patch"),
         ))
+    }
+
+    pub(crate) async fn add_manual_ocr_region(
+        &mut self,
+        page: EntityId,
+        points: &[Point],
+        fixed_font_size: Option<f32>,
+        angle_degrees: f32,
+    ) -> Result<(Commit, EntityId, EntityId)> {
+        let snapshot = self.snapshot();
+        let page_size = snapshot.page(page)?.page()?;
+        let geometry = Self::selection_geometry(points, page_size.width, page_size.height)?;
+        if !angle_degrees.is_finite() || angle_degrees.abs() > 180.0 {
+            bail!("the OCR text angle must be between -180 and 180 degrees");
+        }
+        if fixed_font_size.is_some_and(|size| !size.is_finite() || !(0.5..=300.0).contains(&size)) {
+            bail!("the fixed font size must be between 0.5 and 300");
+        }
+        let left = geometry
+            .points
+            .iter()
+            .map(|point| point.x)
+            .fold(f64::INFINITY, f64::min);
+        let top = geometry
+            .points
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::INFINITY, f64::min);
+        let insert_at = snapshot
+            .page(page)?
+            .text_group()?
+            .map(|group| -> Result<At> {
+                for layer in group.text_layers()? {
+                    let Some(existing) = layer.frame()? else {
+                        continue;
+                    };
+                    let existing_left =
+                        existing.points.iter().map(|point| point.x).reduce(f64::min);
+                    let existing_top = existing.points.iter().map(|point| point.y).reduce(f64::min);
+                    if let (Some(existing_top), Some(existing_left)) = (existing_top, existing_left)
+                        && (existing_top, existing_left) > (top, left)
+                    {
+                        return Ok(At::Before(layer.id()));
+                    }
+                }
+                Ok(At::End)
+            })
+            .transpose()?
+            .unwrap_or(At::End);
+        let mut created = None;
+        let patch = snapshot.patch(|edit| {
+            let region = edit.add_analysis_region::<TextRegion>(page, At::End, &geometry, None)?;
+            let content = edit.add_text_content(page, At::End)?;
+            let layer = edit.add_text_layer(
+                page,
+                insert_at,
+                content,
+                &SceneTextLayout {
+                    origin: Origin::User,
+                    kind: TextLayoutKind::Paragraph,
+                    angle_degrees: (angle_degrees != 0.0).then_some(angle_degrees),
+                },
+            )?;
+            edit.relate::<RecognizedFrom>(content, region)?;
+            edit.relate::<FitsTo>(layer, region)?;
+            if let Some(size) = fixed_font_size {
+                edit.set(
+                    layer,
+                    &SceneTypography {
+                        origin: Origin::User,
+                        preferred_font: None,
+                        font_weight: None,
+                        font_style: None,
+                        size: Some(size),
+                        auto_fit: false,
+                        color: None,
+                        stroke_color: None,
+                        stroke_width: None,
+                        alignment: None,
+                        writing_mode: None,
+                        placement: Some(koharu_scene::TextPlacement::OriginalText),
+                        shear_x: None,
+                        shear_y: None,
+                        shadow: None,
+                        glow: None,
+                        gradient: None,
+                        extensions: Default::default(),
+                    },
+                )?;
+            }
+            created = Some((region, layer));
+            Ok(())
+        })?;
+        let (region, layer) = created.expect("manual OCR region was created");
+        Ok((self.commit(patch).await?, region, layer))
     }
 
     pub(crate) async fn set_source_text(
@@ -553,6 +664,12 @@ impl Project {
                         stroke_width: update.typography.stroke_width,
                         alignment: update.typography.alignment,
                         writing_mode: update.typography.writing_mode,
+                        placement: update.typography.placement,
+                        shear_x: update.typography.shear_x,
+                        shear_y: update.typography.shear_y,
+                        shadow: update.typography.shadow,
+                        glow: update.typography.glow,
+                        gradient: update.typography.gradient,
                         extensions: Default::default(),
                     },
                 )?;
@@ -745,10 +862,14 @@ impl Project {
         mode: RasterStrokeMode,
         color: [u8; 4],
         diameter: f32,
+        hardness: f32,
         points: Vec<ScenePoint>,
     ) -> Result<(Commit, EntityId)> {
         if !diameter.is_finite() || diameter <= 0.0 || points.is_empty() {
             bail!("a raster stroke requires a positive diameter and at least one point");
+        }
+        if !hardness.is_finite() || !(0.0..=100.0).contains(&hardness) {
+            bail!("brush hardness must be between 0 and 100");
         }
         if points
             .iter()
@@ -793,7 +914,7 @@ impl Project {
         if image.dimensions() != (width, height) {
             bail!("raster layer dimensions must match the page");
         }
-        rasterize_stroke(&mut image, mode, color, diameter, &points);
+        rasterize_stroke(&mut image, mode, color, diameter, hardness, &points);
         let mut bytes = Cursor::new(Vec::new());
         DynamicImage::ImageRgba8(image).write_to(&mut bytes, ImageFormat::Png)?;
         let source = AssetRole::new("source")?;
@@ -858,6 +979,153 @@ impl Project {
             self.commit(patch).await?,
             committed_layer.expect("raster layer was selected or added while building the patch"),
         ))
+    }
+
+    pub(crate) async fn rasterize_text_layer(
+        &mut self,
+        page: EntityId,
+        text_layer: EntityId,
+        image: RgbaImage,
+        opacity: f32,
+    ) -> Result<(Commit, EntityId)> {
+        let snapshot = self.snapshot();
+        let page_value = snapshot.page(page)?.page()?;
+        if image.dimensions()
+            != (
+                page_value.width.round() as u32,
+                page_value.height.round() as u32,
+            )
+        {
+            bail!("rasterized text dimensions must match the page");
+        }
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            bail!("rasterized text opacity must be between zero and one");
+        }
+        if !image.pixels().any(|pixel| pixel.0[3] != 0) {
+            bail!("the selected text has no visible pixels to rasterize");
+        }
+        if snapshot.component::<SceneTextLayout>(text_layer)?.is_none()
+            || !snapshot
+                .descendants(page)?
+                .any(|entity| entity.id() == text_layer)
+        {
+            bail!("the selected layer is not text on the active page");
+        }
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image).write_to(&mut encoded, ImageFormat::Png)?;
+        let source = AssetRole::new("source")?;
+        let mut raster_layer = None;
+        let patch = snapshot.patch(|edit| {
+            let mut visibility = snapshot
+                .component::<SceneVisibility>(text_layer)?
+                .unwrap_or(SceneVisibility {
+                    origin: Origin::User,
+                    visible: true,
+                    opacity: 1.0,
+                });
+            edit.promote_entity_to_user(text_layer)?;
+            visibility.origin = Origin::User;
+            visibility.visible = false;
+            edit.set(text_layer, &visibility)?;
+
+            let added = edit.add_entity(page, At::End)?;
+            edit.set(
+                added,
+                &SceneRasterLayer {
+                    origin: Origin::User,
+                    name: "Texto rasterizado".to_owned(),
+                    kind: RasterLayerKind::Paint,
+                },
+            )?;
+            edit.set(
+                added,
+                &SceneVisibility {
+                    origin: Origin::User,
+                    visible: true,
+                    opacity,
+                },
+            )?;
+            edit.set_asset(
+                added,
+                &source,
+                AssetInput::new(
+                    encoded.into_inner(),
+                    "image/png",
+                    AssetMetadata {
+                        width: Some(page_value.width.round() as u32),
+                        height: Some(page_value.height.round() as u32),
+                        attributes: Default::default(),
+                    },
+                ),
+            )?;
+            raster_layer = Some(added);
+            Ok(())
+        })?;
+        Ok((
+            self.commit(patch).await?,
+            raster_layer.expect("the raster layer was created in the patch"),
+        ))
+    }
+
+    pub(crate) async fn restore_original_region(
+        &mut self,
+        page: EntityId,
+        points: &[Point],
+    ) -> Result<Option<Commit>> {
+        let snapshot = self.snapshot();
+        let page_value = snapshot.page(page)?.page()?;
+        let geometry = Self::selection_geometry(points, page_value.width, page_value.height)?;
+        let width = page_value.width.round() as u32;
+        let height = page_value.height.round() as u32;
+        let source = AssetRole::new("source")?;
+        let mut updates = Vec::new();
+        for layer in snapshot.children(page)? {
+            let Some(mut raster) = snapshot.component::<SceneRasterLayer>(layer)? else {
+                continue;
+            };
+            if raster.kind != RasterLayerKind::Cleanup {
+                continue;
+            }
+            let Some(asset) = snapshot.asset(layer, &source)? else {
+                continue;
+            };
+            let bytes = snapshot.read_blob(asset.blob).await?;
+            let mut image = image::load_from_memory(&bytes)?.to_rgba8();
+            if image.dimensions() != (width, height) {
+                bail!("cleanup layer dimensions must match the page");
+            }
+            if !clear_cleanup_pixels(&mut image, &geometry.points) {
+                continue;
+            }
+            let mut output = Cursor::new(Vec::new());
+            DynamicImage::ImageRgba8(image).write_to(&mut output, ImageFormat::Png)?;
+            raster.origin = Origin::User;
+            updates.push((layer, raster, output.into_inner()));
+        }
+        if updates.is_empty() {
+            return Ok(None);
+        }
+        let patch = snapshot.patch(|edit| {
+            for (layer, raster, bytes) in updates {
+                edit.promote_entity_to_user(layer)?;
+                edit.set(layer, &raster)?;
+                edit.set_asset(
+                    layer,
+                    &source,
+                    AssetInput::new(
+                        bytes,
+                        "image/png",
+                        AssetMetadata {
+                            width: Some(width),
+                            height: Some(height),
+                            attributes: Default::default(),
+                        },
+                    ),
+                )?;
+            }
+            Ok(())
+        })?;
+        Ok(Some(self.commit(patch).await?))
     }
 
     pub(crate) async fn undo(&mut self) -> Result<Commit> {
@@ -1109,6 +1377,12 @@ impl Project {
             stroke_width: typography.stroke_width,
             alignment: typography.alignment,
             writing_mode,
+            placement: typography.placement,
+            shear_x: typography.shear_x,
+            shear_y: typography.shear_y,
+            shadow: typography.shadow,
+            glow: typography.glow,
+            gradient: typography.gradient,
         }
     }
 
@@ -1204,6 +1478,78 @@ impl Project {
         Ok(roots)
     }
 
+    pub(crate) fn selection_geometry(
+        points: &[Point],
+        width: f64,
+        height: f64,
+    ) -> Result<SceneGeometry> {
+        if !(3..=256).contains(&points.len()) {
+            bail!("a polygon selection needs between 3 and 256 vertices");
+        }
+        let mut vertices = points
+            .iter()
+            .map(|point| ScenePoint {
+                x: point.x,
+                y: point.y,
+            })
+            .collect::<Vec<_>>();
+        if vertices.iter().any(|point| {
+            !point.x.is_finite()
+                || !point.y.is_finite()
+                || point.x < 0.0
+                || point.y < 0.0
+                || point.x > width
+                || point.y > height
+        }) {
+            bail!("the polygon selection must be inside the page");
+        }
+        let count = vertices.len();
+        let mut twice_area = 0.0;
+        for index in 0..count {
+            let current = vertices[index];
+            let next = vertices[(index + 1) % count];
+            if (current.x - next.x).hypot(current.y - next.y) < 0.5 {
+                bail!("polygon vertices must be distinct");
+            }
+            twice_area += current.x * next.y - next.x * current.y;
+            for other in (index + 2)..count {
+                if (index == 0 && other == count - 1) || other == (index + 1) % count {
+                    continue;
+                }
+                if segments_intersect(
+                    current,
+                    next,
+                    vertices[other],
+                    vertices[(other + 1) % count],
+                ) {
+                    bail!("polygon edges must not cross");
+                }
+            }
+        }
+        if !twice_area.is_finite() || twice_area.abs() < 2.0 {
+            bail!("the polygon selection is too small");
+        }
+        if count == 4 && convex_quad(&vertices) {
+            let start = (0..4)
+                .min_by(|&left, &right| {
+                    let left_point = vertices[left];
+                    let right_point = vertices[right];
+                    (left_point.x + left_point.y)
+                        .total_cmp(&(right_point.x + right_point.y))
+                        .then(left_point.y.total_cmp(&right_point.y))
+                })
+                .unwrap();
+            vertices.rotate_left(start);
+            if vertices[1].x < vertices[3].x {
+                vertices[1..].reverse();
+            }
+        }
+        Ok(SceneGeometry {
+            origin: Origin::User,
+            points: vertices,
+        })
+    }
+
     fn geometry_from_frame(frame: Frame) -> Result<SceneGeometry> {
         if !frame.x.is_finite()
             || !frame.y.is_finite()
@@ -1263,11 +1609,100 @@ fn validate_project_name(name: &str) -> Result<String> {
     Ok(name.to_owned())
 }
 
+fn edge_cross(a: ScenePoint, b: ScenePoint, c: ScenePoint) -> f64 {
+    (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)
+}
+
+fn convex_quad(points: &[ScenePoint]) -> bool {
+    let mut sign = 0.0_f64;
+    for index in 0..4 {
+        let cross = edge_cross(
+            points[index],
+            points[(index + 1) % 4],
+            points[(index + 2) % 4],
+        );
+        if cross.abs() < 1e-9 {
+            return false;
+        }
+        if sign != 0.0 && sign.signum() != cross.signum() {
+            return false;
+        }
+        sign = cross;
+    }
+    true
+}
+
+fn segments_intersect(a: ScenePoint, b: ScenePoint, c: ScenePoint, d: ScenePoint) -> bool {
+    let (ac, ad, ca, cb) = (
+        edge_cross(a, b, c),
+        edge_cross(a, b, d),
+        edge_cross(c, d, a),
+        edge_cross(c, d, b),
+    );
+    if ac * ad < 0.0 && ca * cb < 0.0 {
+        return true;
+    }
+    let on_segment = |start: ScenePoint, end: ScenePoint, point: ScenePoint| {
+        point.x >= start.x.min(end.x) - 1e-9
+            && point.x <= start.x.max(end.x) + 1e-9
+            && point.y >= start.y.min(end.y) - 1e-9
+            && point.y <= start.y.max(end.y) + 1e-9
+    };
+    (ac.abs() < 1e-9 && on_segment(a, b, c))
+        || (ad.abs() < 1e-9 && on_segment(a, b, d))
+        || (ca.abs() < 1e-9 && on_segment(c, d, a))
+        || (cb.abs() < 1e-9 && on_segment(c, d, b))
+}
+
+fn clear_cleanup_pixels(image: &mut RgbaImage, polygon: &[ScenePoint]) -> bool {
+    let top = polygon
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min);
+    let bottom = polygon
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let first_y = (top - 0.5).ceil().max(0.0) as u32;
+    let last_y = (bottom - 0.5).ceil().min(f64::from(image.height())) as u32;
+    let mut changed = false;
+    let mut intersections = Vec::with_capacity(polygon.len());
+    for y in first_y..last_y {
+        intersections.clear();
+        let scan_y = f64::from(y) + 0.5;
+        let mut previous = polygon[polygon.len() - 1];
+        for &current in polygon {
+            if (previous.y > scan_y) != (current.y > scan_y) {
+                intersections.push(
+                    previous.x
+                        + (current.x - previous.x) * (scan_y - previous.y)
+                            / (current.y - previous.y),
+                );
+            }
+            previous = current;
+        }
+        intersections.sort_by(f64::total_cmp);
+        for pair in intersections.chunks_exact(2) {
+            let first_x = (pair[0] - 0.5).ceil().max(0.0) as u32;
+            let last_x = (pair[1] - 0.5).ceil().min(f64::from(image.width())) as u32;
+            for x in first_x..last_x {
+                let pixel = image.get_pixel_mut(x, y);
+                if pixel.0[3] != 0 {
+                    pixel.0 = [0; 4];
+                    changed = true;
+                }
+            }
+        }
+    }
+    changed
+}
+
 fn rasterize_stroke(
     image: &mut RgbaImage,
     mode: RasterStrokeMode,
     color: [u8; 4],
     diameter: f32,
+    hardness: f32,
     points: &[ScenePoint],
 ) {
     let radius = f64::from(diameter) * 0.5;
@@ -1298,7 +1733,7 @@ fn rasterize_stroke(
                 };
                 let distance =
                     ((px - (start.x + t * dx)).powi(2) + (py - (start.y + t * dy)).powi(2)).sqrt();
-                let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0) as f32;
+                let coverage = stroke_coverage(radius, distance, hardness);
                 if coverage == 0.0 {
                     continue;
                 }
@@ -1330,6 +1765,27 @@ fn rasterize_stroke(
     }
 }
 
+fn stroke_coverage(radius: f64, distance: f64, hardness: f32) -> f32 {
+    if hardness >= 100.0 {
+        return (radius + 0.5 - distance).clamp(0.0, 1.0) as f32;
+    }
+
+    let hardness = f64::from(hardness.clamp(0.0, 100.0) / 100.0);
+    let solid_radius = (radius - 0.5).max(0.0) * hardness;
+    let outer_radius = radius + 0.5;
+    if distance <= solid_radius {
+        return 1.0;
+    }
+    if distance >= outer_radius {
+        return 0.0;
+    }
+
+    let progress = ((distance - solid_radius) / (outer_radius - solid_radius)).clamp(0.0, 1.0);
+    let hard_profile = 1.0 - progress;
+    let smooth_profile = 1.0 - progress * progress * (3.0 - 2.0 * progress);
+    (hard_profile * hardness + smooth_profile * (1.0 - hardness)) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use koharu_scene::{Generation, ProducerId, WritingMode};
@@ -1352,6 +1808,12 @@ mod tests {
             stroke_width: None,
             alignment: None,
             writing_mode: Some(WritingMode::Vertical),
+            placement: None,
+            shear_x: None,
+            shear_y: None,
+            shadow: None,
+            glow: None,
+            gradient: None,
             extensions: Default::default(),
         };
 
@@ -1364,6 +1826,71 @@ mod tests {
             Project::typography_view(typography).writing_mode,
             Some(WritingMode::Vertical)
         );
+    }
+
+    #[tokio::test]
+    async fn rasterizing_text_preserves_an_editable_original_and_creates_an_erasable_layer() {
+        let mut session = Session::memory().await.unwrap();
+        let mut setup = session.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 8.0, 8.0), At::End)
+            .unwrap();
+        session.commit(setup.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+        let (_, text_layer) = project
+            .add_text_box(
+                page,
+                Frame {
+                    x: 1.0,
+                    y: 1.0,
+                    width: 4.0,
+                    height: 4.0,
+                    angle_degrees: 0.0,
+                },
+            )
+            .await
+            .unwrap();
+        let mut pixels = RgbaImage::new(8, 8);
+        pixels.put_pixel(3, 4, image::Rgba([20, 30, 40, 255]));
+
+        let (commit, raster_layer) = project
+            .rasterize_text_layer(page, text_layer, pixels, 0.75)
+            .await
+            .unwrap();
+        let snapshot = commit.snapshot;
+        assert_eq!(
+            snapshot
+                .component::<SceneVisibility>(text_layer)
+                .unwrap()
+                .unwrap()
+                .visible,
+            false
+        );
+        assert_eq!(
+            snapshot
+                .component::<SceneRasterLayer>(raster_layer)
+                .unwrap()
+                .unwrap()
+                .kind,
+            RasterLayerKind::Paint
+        );
+        assert_eq!(
+            snapshot
+                .component::<SceneVisibility>(raster_layer)
+                .unwrap()
+                .unwrap()
+                .opacity,
+            0.75
+        );
+        let asset = snapshot
+            .asset(raster_layer, &AssetRole::new("source").unwrap())
+            .unwrap()
+            .unwrap();
+        let saved = snapshot.read_blob(asset.blob).await.unwrap();
+        let saved = image::load_from_memory(&saved).unwrap().to_rgba8();
+        assert_eq!(saved.dimensions(), (8, 8));
+        assert_eq!(saved.get_pixel(3, 4).0, [20, 30, 40, 255]);
+        assert_eq!(saved.get_pixel(0, 0).0[3], 0);
     }
 
     #[tokio::test]
@@ -1444,6 +1971,137 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn manual_ocr_selection_creates_a_recognizable_region_in_reading_order() {
+        let mut session = Session::memory().await.unwrap();
+        let mut setup = session.snapshot().edit();
+        let page = setup
+            .add_page(PageDraft::new("page", 100.0, 100.0), At::End)
+            .unwrap();
+        session.commit(setup.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "test".to_owned());
+        let (_, later) = project
+            .add_text_box(
+                page,
+                Frame {
+                    x: 10.0,
+                    y: 70.0,
+                    width: 40.0,
+                    height: 12.0,
+                    angle_degrees: 0.0,
+                },
+            )
+            .await
+            .unwrap();
+        let (commit, region, layer) = project
+            .add_manual_ocr_region(
+                page,
+                &[
+                    Point { x: 10.0, y: 20.0 },
+                    Point { x: 50.0, y: 20.0 },
+                    Point { x: 50.0, y: 32.0 },
+                    Point { x: 10.0, y: 32.0 },
+                ],
+                Some(26.0),
+                0.0,
+            )
+            .await
+            .unwrap();
+        let snapshot = commit.snapshot;
+        assert!(matches!(
+            snapshot
+                .analysis_region(region)
+                .unwrap()
+                .region()
+                .unwrap()
+                .origin,
+            Origin::User
+        ));
+        let typography = snapshot
+            .component::<SceneTypography>(layer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(typography.size, Some(26.0));
+        assert!(!typography.auto_fit);
+        assert_eq!(
+            snapshot
+                .analysis_region(region)
+                .unwrap()
+                .region()
+                .unwrap()
+                .kind
+                .as_str(),
+            "dev.koharu.region.text"
+        );
+        assert_eq!(
+            snapshot
+                .text_layer(layer)
+                .unwrap()
+                .fit_target()
+                .unwrap()
+                .unwrap()
+                .id(),
+            region
+        );
+        assert_eq!(
+            snapshot
+                .text_layer(layer)
+                .unwrap()
+                .content()
+                .unwrap()
+                .source()
+                .unwrap(),
+            None
+        );
+        let ordered = snapshot
+            .page(page)
+            .unwrap()
+            .text_group()
+            .unwrap()
+            .unwrap()
+            .text_layers()
+            .unwrap()
+            .map(|entry| entry.id())
+            .collect::<Vec<_>>();
+        assert_eq!(ordered, vec![layer, later]);
+
+        let (rotated, region, layer) = project
+            .add_manual_ocr_region(
+                page,
+                &[
+                    Point { x: 30.0, y: 50.0 },
+                    Point { x: 50.0, y: 40.0 },
+                    Point { x: 60.0, y: 50.0 },
+                    Point { x: 40.0, y: 60.0 },
+                ],
+                None,
+                30.0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rotated
+                .snapshot
+                .text_layer(layer)
+                .unwrap()
+                .layout()
+                .unwrap()
+                .angle_degrees,
+            Some(30.0)
+        );
+        assert_ne!(
+            rotated
+                .snapshot
+                .analysis_region(region)
+                .unwrap()
+                .geometry()
+                .unwrap()
+                .points[0]
+                .y,
+            45.0
+        );
+    }
+
     #[test]
     fn raster_strokes_are_continuous_and_erasable() {
         let mut image = RgbaImage::new(32, 16);
@@ -1456,6 +2114,7 @@ mod tests {
             RasterStrokeMode::Paint,
             [210, 40, 20, 255],
             5.0,
+            100.0,
             &points,
         );
         for x in 4..28 {
@@ -1467,6 +2126,7 @@ mod tests {
             RasterStrokeMode::Erase,
             [0, 0, 0, 0],
             5.0,
+            100.0,
             &[ScenePoint { x: 16.0, y: 8.0 }],
         );
         assert_eq!(image.get_pixel(16, 8)[3], 0);
@@ -1478,8 +2138,79 @@ mod tests {
             RasterStrokeMode::Paint,
             [255, 255, 255, 255],
             3.0,
+            100.0,
             &[ScenePoint { x: 2.0, y: 2.0 }],
         );
         assert_eq!(white.get_pixel(2, 2).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn raster_strokes_apply_soft_intermediate_and_hard_brush_profiles() {
+        let center = ScenePoint { x: 16.5, y: 16.5 };
+        let painted_alpha = |hardness, x| {
+            let mut image = RgbaImage::new(32, 32);
+            rasterize_stroke(
+                &mut image,
+                RasterStrokeMode::Paint,
+                [255, 255, 255, 255],
+                20.0,
+                hardness,
+                &[center],
+            );
+            image.get_pixel(x, 16)[3]
+        };
+
+        let soft_paint = painted_alpha(0.0, 24);
+        let medium_paint = painted_alpha(50.0, 24);
+        let hard_paint = painted_alpha(100.0, 24);
+        assert!(soft_paint < medium_paint);
+        assert!(medium_paint < hard_paint);
+        assert_eq!(painted_alpha(100.0, 26), 128);
+
+        let erased_alpha = |hardness, x| {
+            let mut image = RgbaImage::from_pixel(32, 32, image::Rgba([255, 255, 255, 255]));
+            rasterize_stroke(
+                &mut image,
+                RasterStrokeMode::Erase,
+                [0, 0, 0, 0],
+                20.0,
+                hardness,
+                &[center],
+            );
+            image.get_pixel(x, 16)[3]
+        };
+        assert!(erased_alpha(0.0, 24) > erased_alpha(50.0, 24));
+        assert!(erased_alpha(50.0, 24) > erased_alpha(100.0, 24));
+    }
+
+    #[test]
+    fn restoring_a_region_exposes_only_the_original_pixels_beneath_it() {
+        let mut cleanup = RgbaImage::from_pixel(5, 5, image::Rgba([255, 255, 255, 255]));
+        let polygon = vec![
+            ScenePoint { x: 0.0, y: 0.0 },
+            ScenePoint { x: 5.0, y: 0.0 },
+            ScenePoint { x: 5.0, y: 5.0 },
+            ScenePoint { x: 3.0, y: 5.0 },
+            ScenePoint { x: 3.0, y: 2.0 },
+            ScenePoint { x: 2.0, y: 2.0 },
+            ScenePoint { x: 2.0, y: 5.0 },
+            ScenePoint { x: 0.0, y: 5.0 },
+        ];
+        assert!(clear_cleanup_pixels(&mut cleanup, &polygon));
+        assert_eq!(cleanup.get_pixel(1, 1).0, [0, 0, 0, 0]);
+        assert_eq!(cleanup.get_pixel(2, 4).0, [255, 255, 255, 255]);
+        assert_eq!(cleanup.get_pixel(4, 4).0, [0, 0, 0, 0]);
+        assert!(!clear_cleanup_pixels(&mut cleanup, &polygon));
+    }
+
+    #[test]
+    fn polygon_selection_rejects_crossing_edges() {
+        let crossing = [
+            Point { x: 1.0, y: 1.0 },
+            Point { x: 8.0, y: 8.0 },
+            Point { x: 1.0, y: 8.0 },
+            Point { x: 8.0, y: 1.0 },
+        ];
+        assert!(Project::selection_geometry(&crossing, 10.0, 10.0).is_err());
     }
 }

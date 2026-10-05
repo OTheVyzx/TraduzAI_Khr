@@ -33,6 +33,7 @@ import {
   useCommand,
 } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
+import { readTextPresets } from '@/lib/text-presets'
 import * as canvasRuntime from '@koharu/bridge/canvas'
 import {
   commands,
@@ -92,6 +93,12 @@ const textLayer: Layer = {
     stroke_width: 0,
     alignment: 'Center',
     writing_mode: null,
+    placement: null,
+    shear_x: null,
+    shear_y: null,
+    shadow: null,
+    glow: null,
+    gradient: null,
   },
   layout: 'paragraph',
   automatic_region: null,
@@ -135,6 +142,7 @@ const artworkLayer: Layer = {
 
 const preferences: Preferences = {
   pipeline: {
+    page_workers: 4,
     detection: { model: 'koharu-layout-rfdetr-seg-2xl' },
     ocr: { model: 'paddleocr-vl-1.6' },
     translation: {
@@ -667,7 +675,6 @@ describe('greenfield editor', () => {
   })
 
   it('switches tools and applies typography from the contextual inspector', async () => {
-    const user = userEvent.setup()
     installProject()
     const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
     render(
@@ -682,12 +689,9 @@ describe('greenfield editor', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Text' }))
     expect(screen.getByTestId('type-inspector')).toBeInTheDocument()
     expect(screen.getByTestId('type-font-picker')).toHaveTextContent('Noto Sans')
-    expect(screen.getByTestId('type-size')).toHaveValue('')
-    expect(screen.getByTestId('type-size')).toHaveAttribute('placeholder', 'Auto')
+    expect(screen.getByTestId('type-size')).toHaveValue(24)
     expect(screen.getByRole('combobox', { name: 'Text direction' })).toHaveTextContent('Auto')
-    await user.clear(screen.getByTestId('type-size'))
-    await user.type(screen.getByTestId('type-size'), '18')
-    await user.tab()
+    fireEvent.change(screen.getByTestId('type-size'), { target: { value: '18' } })
     await waitFor(() =>
       expect(setTypography).toHaveBeenCalledWith(
         expect.arrayContaining([
@@ -698,6 +702,125 @@ describe('greenfield editor', () => {
         ]),
       ),
     )
+  })
+
+  it('enables a text shadow and saves its style as a reusable preset', async () => {
+    const user = userEvent.setup()
+    installProject()
+    localStorage.clear()
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    render(<Inspector />)
+
+    await user.click(screen.getByRole('tab', { name: 'Efeitos' }))
+    await user.click(screen.getByRole('button', { name: 'Ativar sombra' }))
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenCalledWith([
+        expect.objectContaining({
+          layer: 'element',
+          typography: expect.objectContaining({
+            shadow: expect.objectContaining({ offset_x: 2, offset_y: 2 }),
+          }),
+        }),
+      ]),
+    )
+    await user.click(screen.getByRole('tab', { name: 'Presets' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Nome do preset' }), {
+      target: { value: 'Diálogo' },
+    })
+    await user.click(screen.getByRole('button', { name: 'Salvar' }))
+    expect(readTextPresets()).toEqual([expect.objectContaining({ name: 'Diálogo' })])
+  })
+
+  it('pastes only the selected typography groups', async () => {
+    const user = userEvent.setup()
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [
+        ...page.layers,
+        {
+          ...secondLayer,
+          typography: {
+            ...secondLayer.typography!,
+            preferred_font: 'Target Font',
+            color: [255, 0, 0, 255],
+          },
+        },
+      ],
+    }))
+    useKoharuStore.setState({
+      layerFrames: {
+        ...useKoharuStore.getState().layerFrames,
+        second: { x: 40, y: 60, width: 80, height: 40, angle_degrees: 0 },
+      },
+    })
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    const commitTransform = vi.spyOn(commands, 'commitTransform').mockResolvedValue(3)
+    render(<Inspector />)
+
+    await user.click(screen.getByRole('tab', { name: 'Presets' }))
+    await user.click(screen.getByRole('button', { name: 'Copiar atributos' }))
+    act(() => useKoharuStore.setState({ selectedLayers: ['second'] }))
+    await user.click(screen.getByRole('button', { name: 'Colar atributos…' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Fonte e tamanho' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Quadro: posição, tamanho e rotação' }))
+    expect(screen.getByRole('checkbox', { name: 'Fonte e tamanho' })).not.toBeChecked()
+    expect(
+      screen.getByRole('checkbox', { name: 'Quadro: posição, tamanho e rotação' }),
+    ).not.toBeChecked()
+    await user.click(screen.getByRole('button', { name: 'Aplicar selecionados' }))
+
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenCalledWith([
+        expect.objectContaining({
+          layer: 'second',
+          typography: expect.objectContaining({
+            preferred_font: 'Target Font',
+            color: textLayer.typography?.color,
+          }),
+        }),
+      ]),
+    )
+    expect(commitTransform).not.toHaveBeenCalled()
+  })
+
+  it('keeps earlier effects when another effect is enabled before the page refreshes', async () => {
+    const user = userEvent.setup()
+    installProject()
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    render(<Inspector />)
+
+    await user.click(screen.getByRole('tab', { name: 'Efeitos' }))
+    await user.click(screen.getByRole('button', { name: 'Ativar sombra' }))
+    await user.click(screen.getByRole('button', { name: 'Ativar brilho' }))
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenLastCalledWith([
+        expect.objectContaining({
+          typography: expect.objectContaining({
+            shadow: expect.any(Object),
+            glow: expect.any(Object),
+          }),
+        }),
+      ]),
+    )
+  })
+
+  it('rasterizes selected text and prepares the resulting layer for erasing', async () => {
+    const user = userEvent.setup()
+    installProject()
+    const rasterizeText = vi.spyOn(commands, 'rasterizeText').mockResolvedValue({
+      revision: 2,
+      layer: 'rasterized',
+    })
+    render(<Inspector />)
+
+    await user.click(screen.getByRole('button', { name: 'Rasterizar texto selecionado' }))
+
+    expect(rasterizeText).toHaveBeenCalledWith(1, 'element')
+    await waitFor(() => {
+      expect(useKoharuStore.getState().selectedLayers).toEqual(['rasterized'])
+      expect(useKoharuStore.getState().tool).toBe('eraser')
+    })
   })
 
   it('defaults vertical text alignment to top and maps end to bottom', async () => {
@@ -732,7 +855,7 @@ describe('greenfield editor', () => {
     )
   })
 
-  it('adjusts brush size from the toolbar popover', async () => {
+  it('keeps the brush size input selectable and accepts typed values', async () => {
     const user = userEvent.setup()
     installProject()
     useKoharuStore.setState({ tool: 'draw' })
@@ -743,27 +866,32 @@ describe('greenfield editor', () => {
     )
 
     await user.click(screen.getByRole('button', { name: 'Brush size: 48 pixels' }))
-    expect(screen.getByRole('textbox', { name: 'Brush size' })).toHaveValue('48')
+    expect(screen.getByRole('spinbutton', { name: 'Tamanho do pincel' })).toHaveValue(48)
 
-    await user.click(screen.getByRole('button', { name: 'Increase brush size' }))
+    const size = screen.getByRole('spinbutton', { name: 'Tamanho do pincel' })
+    fireEvent.pointerDown(size, { button: 0, pointerId: 44, clientX: 0 })
+    fireEvent.pointerMove(size, { pointerId: 44, clientX: 3 })
+    fireEvent.pointerUp(size, { pointerId: 44, clientX: 3 })
+    expect(useKoharuStore.getState().brush.diameter).toBe(48)
+
+    fireEvent.change(size, { target: { value: '49' } })
     expect(useKoharuStore.getState().brush.diameter).toBe(49)
   })
 
-  it('uses the border color well to enable and disable the border', async () => {
+  it('toggles the outline without discarding its color', async () => {
     const user = userEvent.setup()
     installProject()
     const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
     render(<Inspector />)
 
-    expect(screen.queryByRole('button', { name: 'Enable text border' })).not.toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Border color' }))
-    await user.click(screen.getByRole('button', { name: 'Transparent' }))
+    await user.click(screen.getByRole('tab', { name: 'Efeitos' }))
+    await user.click(screen.getByRole('button', { name: 'Ativar contorno' }))
     await waitFor(() =>
       expect(setTypography).toHaveBeenCalledWith([
         expect.objectContaining({
           layer: 'element',
           typography: expect.objectContaining({
-            stroke_color: [255, 255, 255, 0],
+            stroke_color: [255, 255, 255, 255],
             stroke_width: 1.5,
           }),
         }),
@@ -771,15 +899,13 @@ describe('greenfield editor', () => {
     )
 
     setTypography.mockClear()
-    fireEvent.change(screen.getByRole('textbox', { name: 'Hex color code' }), {
-      target: { value: '#FF0000' },
-    })
+    await user.click(screen.getByRole('button', { name: 'Desativar contorno' }))
     await waitFor(() =>
       expect(setTypography).toHaveBeenCalledWith([
         expect.objectContaining({
           layer: 'element',
           typography: expect.objectContaining({
-            stroke_color: [255, 0, 0, 255],
+            stroke_color: [255, 255, 255, 0],
             stroke_width: 1.5,
           }),
         }),
@@ -1062,6 +1188,56 @@ describe('greenfield editor', () => {
     expect(screen.getByRole('button', { name: /Output English/ })).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
     expect(useKoharuStore.getState().settingsOpen).toBe(true)
+  })
+
+  it('fills the current page when inpainting is pending', async () => {
+    installProject()
+    const process = vi.spyOn(commands, 'process').mockResolvedValue('job')
+    render(<CanvasCommandBar />)
+
+    const fillButton = screen.getByRole('button', { name: 'Fill pending: 1' })
+    expect(fillButton).toBeEnabled()
+    fireEvent.click(fillButton)
+
+    await waitFor(() =>
+      expect(process).toHaveBeenCalledWith(
+        { scope: 'pages', value: ['page'] },
+        { operation: 'only', stage: 'inpainting' },
+      ),
+    )
+  })
+
+  it('counts pending source texts instead of counting the page once', () => {
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [...page.layers, secondLayer],
+    }))
+    render(<CanvasCommandBar />)
+
+    expect(screen.getByRole('button', { name: 'Fill pending: 2' })).toBeEnabled()
+  })
+
+  it('does not count a page as pending after cleanup has been generated', () => {
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [
+        ...page.layers,
+        {
+          type: 'raster',
+          id: 'cleanup',
+          parent: 'page',
+          visibility: { visible: true, opacity: 1 },
+          image: 'cleanup-image',
+          name: 'Cleanup',
+          kind: 'cleanup',
+        },
+      ],
+    }))
+    render(<CanvasCommandBar />)
+
+    expect(screen.getByRole('button', { name: 'Fill pending: 0' })).toBeDisabled()
   })
 
   it('configures translation output from the runtime selector', async () => {

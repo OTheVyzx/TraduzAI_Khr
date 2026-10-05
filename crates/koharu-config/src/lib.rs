@@ -33,6 +33,7 @@ use tokio::sync::watch;
 
 const CONFIG_DIRECTORY: &str = ".koharu";
 const CONFIG_FILE: &str = "config.toml";
+pub const DATA_DIRECTORY_ENV: &str = "KOHARU_DATA_DIR";
 
 static MANAGER: OnceLock<Result<Arc<Manager>, String>> = OnceLock::new();
 
@@ -370,10 +371,32 @@ impl Manager {
     }
 }
 
-/// Returns the shared Koharu configuration path: `~/.koharu/config.toml`.
+/// Returns the shared Koharu configuration path, honoring `KOHARU_DATA_DIR` when set.
 pub fn path() -> Result<PathBuf> {
+    if let Some(directory) = data_directory()? {
+        return Ok(directory.join(CONFIG_FILE));
+    }
+
     let home = dirs::home_dir().context("could not determine the home directory")?;
     Ok(home.join(CONFIG_DIRECTORY).join(CONFIG_FILE))
+}
+
+/// Returns the configured root for Koharu-owned user data, if one is set.
+pub fn data_directory() -> Result<Option<PathBuf>> {
+    resolve_data_directory(std::env::var_os(DATA_DIRECTORY_ENV).map(PathBuf::from))
+}
+
+fn resolve_data_directory(directory: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    if let Some(directory) = directory {
+        anyhow::ensure!(
+            directory.is_absolute(),
+            "{DATA_DIRECTORY_ENV} must be an absolute path: {}",
+            directory.display()
+        );
+        Ok(Some(directory))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Load or retrieve a live, process-wide top-level configuration section.
@@ -534,6 +557,17 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let manager = Manager::new(directory.path().join(CONFIG_FILE));
         (directory, manager)
+    }
+
+    #[test]
+    fn configured_data_directory_must_be_absolute() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_data_directory(Some(directory.path().to_owned())).unwrap(),
+            Some(directory.path().to_owned())
+        );
+        assert!(resolve_data_directory(Some(PathBuf::from("relative"))).is_err());
+        assert_eq!(resolve_data_directory(None).unwrap(), None);
     }
 
     #[test]

@@ -136,6 +136,8 @@
     "providerDefault": "제공자 기본값",
     "run": "실행",
     "runProcessing": "처리 실행",
+    "translateMissing": "미번역 번역: {{count}}",
+    "fillMissing": "미채움 채우기: {{count}}",
     "scope": "범위",
     "scopeShort": {
       "page": "페이지",
@@ -390,6 +392,12 @@
         "textThreshold": "텍스트 임곗값"
       },
       "processing": "처리 중",
+      "parallelism": "병렬 처리",
+      "workers": {
+        "description": "현재 단계에서 활성화할 페이지 수를 제한합니다. VRAM 사용량을 관리하기 위해 GPU 추론은 직렬로 실행됩니다.",
+        "label": "활성 페이지",
+        "title": "페이지 작업자"
+      },
       "stages": {
         "detection": {
           "description": "텍스트, 말풍선, 패널을 찾습니다.",
@@ -503,9 +511,13 @@
     "draw": "그리기",
     "eraser": "지우개",
     "increaseBrushSize": "브러시 크기 늘리기",
+    "inpaint_region": "다각형 영역 인페인트",
+    "ocr_region": "영역의 텍스트 인식",
     "pan": "이동",
     "remove": "제거",
+    "restore_region": "영역의 원본 이미지 복원",
     "select": "선택",
+    "snap_to_center": "텍스트를 이미지 중앙에 맞추기",
     "text": "텍스트"
   },
   "updater": {

@@ -74,7 +74,10 @@ export function SettingsPage() {
   const lastSavedProviders = useRef<string | null>(null)
   const saveGeneration = useRef(0)
   const saveQueue = useRef<Promise<void>>(Promise.resolve())
-  const lastPending = useRef<{ serialized: string; promise: Promise<Preferences> } | null>(null)
+  const lastPending = useRef<{
+    serialized: string
+    promise: Promise<Preferences>
+  } | null>(null)
   const currentDraft = useRef<string | null>(null)
   currentDraft.current =
     pipeline && providers && typesetting ? JSON.stringify([pipeline, providers, typesetting]) : null
@@ -305,8 +308,11 @@ function ShortcutPreferences() {
   const actions: ShortcutAction[] = [
     'select',
     'text',
+    'ocr_region',
+    'inpaint_region',
     'draw',
     'eraser',
+    'restore_region',
     'color_picker',
     'remove',
     'pan',
@@ -321,7 +327,9 @@ function ShortcutPreferences() {
         {actions.map((action) => (
           <PreferenceRow key={action} title={t(shortcutKeys[action])}>
             <Input
-              aria-label={t('settings.shortcuts.inputLabel', { action: t(shortcutKeys[action]) })}
+              aria-label={t('settings.shortcuts.inputLabel', {
+                action: t(shortcutKeys[action]),
+              })}
               maxLength={1}
               value={shortcuts[action]}
               className='ml-auto h-8 w-14 text-center text-[12px] uppercase'
@@ -342,8 +350,11 @@ function LoadingPreferences() {
 const shortcutKeys: Record<ShortcutAction, string> = {
   select: 'tools.select',
   text: 'tools.text',
+  ocr_region: 'tools.ocr_region',
+  inpaint_region: 'tools.inpaint_region',
   draw: 'tools.draw',
   eraser: 'tools.eraser',
+  restore_region: 'tools.restore_region',
   color_picker: 'tools.color_picker',
   remove: 'tools.remove',
   pan: 'tools.pan',

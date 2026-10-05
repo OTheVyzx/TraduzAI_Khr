@@ -114,6 +114,39 @@ pub enum FontStyle {
 }
 
 #[revisioned(revision = 1)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPlacement {
+    OriginalText,
+    Balloon,
+    Manual,
+}
+
+#[revisioned(revision = 1)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+pub struct TextShadow {
+    pub color: [u8; 4],
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub blur_radius: f32,
+}
+
+#[revisioned(revision = 1)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+pub struct TextGlow {
+    pub color: [u8; 4],
+    pub radius: f32,
+}
+
+#[revisioned(revision = 1)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+pub struct TextGradient {
+    pub start_color: [u8; 4],
+    pub end_color: [u8; 4],
+    pub angle_degrees: f32,
+}
+
+#[revisioned(revision = 3)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct Typography {
     pub origin: Origin,
@@ -127,6 +160,18 @@ pub struct Typography {
     pub stroke_width: Option<f32>,
     pub alignment: Option<TextAlignment>,
     pub writing_mode: Option<WritingMode>,
+    #[revision(start = 2)]
+    pub placement: Option<TextPlacement>,
+    #[revision(start = 2)]
+    pub shear_x: Option<f32>,
+    #[revision(start = 3)]
+    pub shear_y: Option<f32>,
+    #[revision(start = 2)]
+    pub shadow: Option<TextShadow>,
+    #[revision(start = 2)]
+    pub glow: Option<TextGlow>,
+    #[revision(start = 2)]
+    pub gradient: Option<TextGradient>,
     pub extensions: BTreeMap<String, String>,
 }
 
@@ -148,6 +193,27 @@ impl Component for Typography {
             || self
                 .stroke_width
                 .is_some_and(|width| !width.is_finite() || width < 0.0)
+            || self
+                .shear_x
+                .is_some_and(|shear| !shear.is_finite() || shear.abs() > 4.0)
+            || self
+                .shear_y
+                .is_some_and(|shear| !shear.is_finite() || shear.abs() > 4.0)
+            || self.shadow.as_ref().is_some_and(|shadow| {
+                !shadow.offset_x.is_finite()
+                    || !shadow.offset_y.is_finite()
+                    || shadow.offset_x.abs() > 10_000.0
+                    || shadow.offset_y.abs() > 10_000.0
+                    || !shadow.blur_radius.is_finite()
+                    || shadow.blur_radius < 0.0
+                    || shadow.blur_radius > 128.0
+            })
+            || self.glow.as_ref().is_some_and(|glow| {
+                !glow.radius.is_finite() || !(0.0..=128.0).contains(&glow.radius)
+            })
+            || self.gradient.as_ref().is_some_and(|gradient| {
+                !gradient.angle_degrees.is_finite() || gradient.angle_degrees.abs() > 3600.0
+            })
         {
             return Err(Error::invalid("typography intent is invalid"));
         }

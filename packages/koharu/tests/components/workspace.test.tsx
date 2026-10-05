@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CanvasWorkspace } from '@/components/editor/CanvasWorkspace'
 import { pageKey, pagesKey, projectKey, queryClient } from '@/lib/queries'
 import { useKoharuStore } from '@/lib/store'
+import { defaultTypography } from '@/lib/typography'
 import { commands, type Layer } from '@koharu/bridge/protocol'
 import { TooltipProvider } from '@koharu/ui/components/tooltip'
 
@@ -30,6 +31,8 @@ const canvas = vi.hoisted(() => ({
 }))
 
 const canvasState = vi.hoisted(() => ({
+  activePage: 'page' as string | null,
+  activeRevision: 1 as number | null,
   canvas,
   error: null as Error | null,
   generation: 1 as number | null,
@@ -73,6 +76,25 @@ const paintLayer: Layer = {
   kind: 'paint',
 }
 
+const dialogueLayer: Layer = {
+  type: 'text',
+  id: 'dialogue',
+  parent: 'page',
+  geometry: layer.geometry,
+  angle_degrees: 0,
+  visibility: { visible: true, opacity: 1 },
+  content: {
+    id: 'dialogue-content',
+    source: { text: 'Original line', language: 'en' },
+    translation: { text: 'Linha traduzida', language: 'pt-BR' },
+    role: null,
+    source_region: null,
+  },
+  typography: defaultTypography,
+  layout: 'paragraph',
+  automatic_region: null,
+}
+
 let nextAnimationFrame = 1
 let animationFrames = new Map<number, FrameRequestCallback>()
 
@@ -86,6 +108,8 @@ beforeEach(() => {
   })
   vi.stubGlobal('cancelAnimationFrame', (frame: number) => animationFrames.delete(frame))
   canvasState.error = null
+  canvasState.activePage = 'page'
+  canvasState.activeRevision = 1
   canvasState.generation = 1
   canvasState.hasFrame = true
   canvasState.status = 'ready'
@@ -221,7 +245,10 @@ describe('canvas interaction adapter', () => {
 
   it('previews brush input locally and sends only the durable paint commit to Rust', async () => {
     installProject()
-    useKoharuStore.setState({ tool: 'draw', brush: { diameter: 48, color: '#FFFFFF' } })
+    useKoharuStore.setState({
+      tool: 'draw',
+      brush: { diameter: 48, hardness: 100, color: '#FFFFFF' },
+    })
     const commit = vi
       .spyOn(commands, 'commitPaint')
       .mockResolvedValue({ revision: 2, layer: 'paint' })
@@ -238,22 +265,75 @@ describe('canvas interaction adapter', () => {
       layer: null,
       point: { x: 20, y: 20 },
       diameter: 48,
+      hardness: 100,
       color: [255, 255, 255, 255],
     })
     expect(canvas.extendStroke).toHaveBeenCalledWith(expect.arrayContaining([{ x: 45, y: 45 }]))
     expect(canvas.finishStroke).toHaveBeenCalledOnce()
-    expect(commit).toHaveBeenCalledWith(1, null, expect.arrayContaining([{ x: 45, y: 45 }]), {
+    expect(commit).toHaveBeenCalledWith(1, 'page', null, expect.arrayContaining([{ x: 45, y: 45 }]), {
       diameter: 48,
+      hardness: 100,
       color: [255, 255, 255, 255],
     })
+  })
+
+  it('copies and pastes selected text layers with Ctrl+C and Ctrl+V', async () => {
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [dialogueLayer],
+    }))
+    useKoharuStore.setState({ selectedLayers: ['dialogue'] })
+    const addTextBox = vi
+      .spyOn(commands, 'addTextBox')
+      .mockResolvedValue({ revision: 2, layer: 'pasted-dialogue' })
+    const setSourceText = vi.spyOn(commands, 'setSourceText').mockResolvedValue(null)
+    const setTranslation = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    vi.spyOn(commands, 'getProject').mockResolvedValue({
+      name: 'Book',
+      revision: 2,
+      active_page: 'page',
+      can_undo: false,
+      can_redo: false,
+    })
+    const commitTransform = vi.spyOn(commands, 'commitTransform').mockResolvedValue(3)
+    renderWorkspace()
+
+    fireEvent.keyDown(window, { key: 'c', ctrlKey: true })
+    fireEvent.keyDown(window, { key: 'v', ctrlKey: true })
+
+    await waitFor(() => expect(setTypography).toHaveBeenCalledOnce())
+    expect(addTextBox).toHaveBeenCalledWith({
+      x: 22,
+      y: 32,
+      width: 100,
+      height: 50,
+      angle_degrees: 0,
+    })
+    expect(setSourceText).toHaveBeenCalledWith('pasted-dialogue', 'Original line')
+    expect(setTranslation).toHaveBeenCalledWith('pasted-dialogue', 'Linha traduzida')
+    expect(setTypography).toHaveBeenCalledWith([
+      { layer: 'pasted-dialogue', typography: defaultTypography },
+    ])
+    expect(commitTransform).toHaveBeenCalledWith(2, 'page', [
+      {
+        element: 'pasted-dialogue',
+        frame: { x: 22, y: 32, width: 100, height: 50, angle_degrees: 0 },
+      },
+    ])
+    expect(useKoharuStore.getState().selectedLayers).toEqual(['pasted-dialogue'])
   })
 
   it.each([
     ['revision', { canvasRevision: 2 }],
     ['generation', { canvasGeneration: 2 }],
-  ])('cancels an active gesture when the canvas %s changes', async (_name, update) => {
+  ])('keeps an active gesture when the canvas %s changes', async (_name, update) => {
     installProject()
-    useKoharuStore.setState({ tool: 'draw', brush: { diameter: 48, color: '#FFFFFF' } })
+    useKoharuStore.setState({
+      tool: 'draw',
+      brush: { diameter: 48, hardness: 100, color: '#FFFFFF' },
+    })
     const commit = vi
       .spyOn(commands, 'commitPaint')
       .mockResolvedValue({ revision: 2, layer: 'paint' })
@@ -266,10 +346,31 @@ describe('canvas interaction adapter', () => {
       useKoharuStore.setState(update)
     })
 
-    await waitFor(() => expect(canvas.cancelStroke).toHaveBeenCalledOnce())
+    expect(canvas.cancelStroke).not.toHaveBeenCalled()
     fireEvent.pointerUp(surface, { pointerId: 8, clientX: 30, clientY: 40 })
-    expect(canvas.finishStroke).not.toHaveBeenCalled()
-    expect(commit).not.toHaveBeenCalled()
+    await waitFor(() => expect(commit).toHaveBeenCalledOnce())
+    expect(canvas.finishStroke).toHaveBeenCalledOnce()
+    expect(commit).toHaveBeenCalledWith(1, 'page', null, expect.any(Array), expect.any(Object))
+  })
+
+  it('keeps the canvas editable on the same page while the next frame is prepared', async () => {
+    installProject()
+    useKoharuStore.setState({
+      canvasGeneration: 2,
+      tool: 'draw',
+      brush: { diameter: 48, hardness: 100, color: '#FFFFFF' },
+    })
+    canvasState.status = 'switching'
+    const commit = vi
+      .spyOn(commands, 'commitPaint')
+      .mockResolvedValue({ revision: 2, layer: 'paint' })
+    const surface = renderWorkspace()
+
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 81, clientX: 30, clientY: 40 })
+    fireEvent.pointerUp(surface, { pointerId: 81, clientX: 30, clientY: 40 })
+
+    await waitFor(() => expect(commit).toHaveBeenCalledOnce())
+    expect(commit).toHaveBeenCalledWith(1, 'page', null, expect.any(Array), expect.any(Object))
   })
 
   it('uses rendered text bounds for hit testing and semantic transforms', async () => {
@@ -328,6 +429,7 @@ describe('canvas interaction adapter', () => {
     expect(canvas.finishTransform).toHaveBeenCalledOnce()
     expect(commit).toHaveBeenCalledWith(
       1,
+      'page',
       expect.arrayContaining([
         expect.objectContaining({
           element: 'element',
@@ -365,11 +467,171 @@ describe('canvas interaction adapter', () => {
     )
     expect(commit).toHaveBeenCalledWith(
       1,
+      'page',
       expect.arrayContaining([
         {
           element: 'element',
           frame: { x: 10, y: 20, width: 120, height: 50, angle_degrees: 0 },
         },
+      ]),
+    )
+  })
+
+  it('scales the rendered font size with a text frame in proportional mode', async () => {
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [
+        {
+          type: 'text',
+          id: 'element',
+          parent: 'page',
+          geometry: layer.geometry,
+          angle_degrees: 0,
+          visibility: { visible: true, opacity: 1 },
+          content: {
+            id: 'content',
+            source: { text: 'Source', language: 'en' },
+            translation: { text: 'Text', language: null },
+            role: null,
+            source_region: null,
+          },
+          typography: null,
+          layout: 'paragraph',
+          automatic_region: null,
+        },
+      ],
+    }))
+    useKoharuStore.setState({
+      selectedLayers: ['element'],
+      resizeMode: 'scale',
+      fontSizes: { element: 20 },
+    })
+    vi.spyOn(commands, 'commitTransform').mockResolvedValue(2)
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    renderWorkspace()
+    Object.defineProperty(screen.getByTestId('canvas-overlay'), 'getBoundingClientRect', {
+      value: () => ({ x: 10, y: 20, width: 800, height: 600 }),
+    })
+    const handle = document.querySelector<HTMLElement>('[data-resize-handle="e"]')!
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 11, clientX: 120, clientY: 65 })
+    fireEvent.pointerMove(handle, { pointerId: 11, clientX: 140, clientY: 65 })
+    fireEvent.pointerUp(handle, { pointerId: 11, clientX: 140, clientY: 65 })
+
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenCalledWith([
+        expect.objectContaining({
+          layer: 'element',
+          typography: expect.objectContaining({ size: 24, auto_fit: false }),
+        }),
+      ]),
+    )
+  })
+
+  it('shears selected text when the pink edge is dragged without rotating it', async () => {
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [
+        {
+          type: 'text',
+          id: 'element',
+          parent: 'page',
+          geometry: layer.geometry,
+          angle_degrees: 0,
+          visibility: { visible: true, opacity: 1 },
+          content: {
+            id: 'content',
+            source: { text: 'Source', language: 'en' },
+            translation: { text: 'Text', language: null },
+            role: null,
+            source_region: null,
+          },
+          typography: null,
+          layout: 'paragraph',
+          automatic_region: null,
+        },
+      ],
+    }))
+    useKoharuStore.setState({ selectedLayers: ['element'] })
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    renderWorkspace()
+    Object.defineProperty(screen.getByTestId('canvas-overlay'), 'getBoundingClientRect', {
+      value: () => ({ x: 10, y: 20, width: 800, height: 600 }),
+    })
+    const handle = document.querySelector<HTMLElement>('[data-shear-handle]')!
+    expect(handle).not.toBeNull()
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 12, clientX: 60, clientY: 20 })
+    fireEvent.pointerMove(handle, { pointerId: 12, clientX: 80, clientY: 20 })
+    fireEvent.pointerUp(handle, { pointerId: 12, clientX: 80, clientY: 20 })
+
+    expect(canvas.beginTransform).toHaveBeenCalledOnce()
+    expect(canvas.updateTransform).toHaveBeenCalledWith(
+      [{ element: 'element', frame: { x: 10, y: 20, width: 100, height: 50, angle_degrees: 0 } }],
+      { x: 0.4, y: 0 },
+    )
+
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenCalledWith([
+        expect.objectContaining({
+          layer: 'element',
+          typography: expect.objectContaining({ shear_x: 0.4 }),
+        }),
+      ]),
+    )
+  })
+
+  it('shears selected text vertically while preserving horizontal shear', async () => {
+    installProject()
+    queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
+      ...page,
+      layers: [
+        {
+          type: 'text',
+          id: 'element',
+          parent: 'page',
+          geometry: layer.geometry,
+          angle_degrees: 0,
+          visibility: { visible: true, opacity: 1 },
+          content: {
+            id: 'content',
+            source: { text: 'Source', language: 'en' },
+            translation: { text: 'Text', language: null },
+            role: null,
+            source_region: null,
+          },
+          typography: { ...defaultTypography, shear_x: 0.2 },
+          layout: 'paragraph',
+          automatic_region: null,
+        },
+      ],
+    }))
+    useKoharuStore.setState({ selectedLayers: ['element'] })
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    renderWorkspace()
+    Object.defineProperty(screen.getByTestId('canvas-overlay'), 'getBoundingClientRect', {
+      value: () => ({ x: 10, y: 20, width: 800, height: 600 }),
+    })
+    const handle = document.querySelector<HTMLElement>('[data-shear-y-handle]')!
+    expect(handle).not.toBeNull()
+    fireEvent.pointerDown(handle, { button: 0, pointerId: 13, clientX: 10, clientY: 45 })
+    fireEvent.pointerMove(handle, { pointerId: 13, clientX: 10, clientY: 75 })
+    fireEvent.pointerUp(handle, { pointerId: 13, clientX: 10, clientY: 75 })
+
+    expect(canvas.beginTransform).toHaveBeenCalledWith(
+      [{ element: 'element', frame: { x: 10, y: 20, width: 100, height: 50, angle_degrees: 0 } }],
+      { x: 0.2, y: 0 },
+    )
+    expect(canvas.updateTransform).toHaveBeenCalledWith(
+      [{ element: 'element', frame: { x: 10, y: 20, width: 100, height: 50, angle_degrees: 0 } }],
+      { x: 0.2, y: 0.3 },
+    )
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenCalledWith([
+        expect.objectContaining({
+          layer: 'element',
+          typography: expect.objectContaining({ shear_x: 0.2, shear_y: 0.3 }),
+        }),
       ]),
     )
   })
@@ -451,8 +713,16 @@ describe('canvas interaction adapter', () => {
       layer: 'paint',
       point: { x: 20, y: 20 },
       diameter: 48,
+      hardness: 100,
     })
-    expect(commit).toHaveBeenCalledWith(1, 'paint', expect.arrayContaining([{ x: 20, y: 20 }]), 48)
+    expect(commit).toHaveBeenCalledWith(
+      1,
+      'page',
+      'paint',
+      expect.arrayContaining([{ x: 20, y: 20 }]),
+      48,
+      100,
+    )
   })
 
   it('maps the Remove tool to an inpainting mask gesture', async () => {
@@ -470,8 +740,9 @@ describe('canvas interaction adapter', () => {
       layer: null,
       point: { x: 20, y: 20 },
       diameter: 48,
+      hardness: 100,
     })
-    expect(commit).toHaveBeenCalledWith(1, expect.arrayContaining([{ x: 20, y: 20 }]), 48)
+    expect(commit).toHaveBeenCalledWith(1, 'page', expect.arrayContaining([{ x: 20, y: 20 }]), 48)
   })
 
   it('creates point text on click and paragraph text on drag', async () => {
@@ -500,5 +771,112 @@ describe('canvas interaction adapter', () => {
       height: 60,
       angle_degrees: 0,
     })
+  })
+
+  it('applies the configured fixed size to newly created text', async () => {
+    installProject()
+    useKoharuStore.setState({ tool: 'text', defaultFontSize: 28 })
+    vi.spyOn(commands, 'addPointText').mockResolvedValue({ revision: 2, layer: 'new-text' })
+    const setTypography = vi.spyOn(commands, 'setTypography').mockResolvedValue(null)
+    const surface = renderWorkspace()
+
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 51, clientX: 30, clientY: 40 })
+    fireEvent.pointerUp(surface, { pointerId: 51, clientX: 30, clientY: 40 })
+
+    await waitFor(() =>
+      expect(setTypography).toHaveBeenCalledWith([
+        expect.objectContaining({
+          layer: 'new-text',
+          typography: expect.objectContaining({ size: 28, auto_fit: false }),
+        }),
+      ]),
+    )
+  })
+
+  it('recognizes a closed polygon and selects its text layer', async () => {
+    installProject()
+    useKoharuStore.setState({ tool: 'ocr_region', defaultFontSize: 26, ocrRegionAngle: 30 })
+    const recognize = vi.spyOn(commands, 'recognizeSelectedRegion').mockResolvedValue({
+      revision: 2,
+      layer: 'recognized-text',
+      job: 'ocr-job',
+    })
+    const surface = renderWorkspace()
+
+    for (const [x, y] of [
+      [40, 50],
+      [140, 50],
+      [140, 110],
+      [40, 110],
+    ]) {
+      fireEvent.pointerDown(surface, { button: 0, pointerId: 21, clientX: x, clientY: y })
+      fireEvent.pointerUp(surface, { pointerId: 21, clientX: x, clientY: y })
+    }
+    expect(recognize).not.toHaveBeenCalled()
+    fireEvent.pointerDown(surface, { button: 0, pointerId: 21, clientX: 40, clientY: 50 })
+    fireEvent.pointerUp(surface, { pointerId: 21, clientX: 40, clientY: 50 })
+
+    await waitFor(() => expect(recognize).toHaveBeenCalledOnce())
+    expect(recognize).toHaveBeenCalledWith(
+      1,
+      'page',
+      [
+        { x: 30, y: 30 },
+        { x: 130, y: 30 },
+        { x: 130, y: 90 },
+        { x: 30, y: 90 },
+      ],
+      26,
+      30,
+    )
+    expect(useKoharuStore.getState().selectedLayers).toEqual(['recognized-text'])
+  })
+
+  it('restores a concave polygon only after Enter', async () => {
+    installProject()
+    useKoharuStore.setState({ tool: 'restore_region' })
+    const restore = vi.spyOn(commands, 'restoreOriginalRegion').mockResolvedValue(2)
+    const surface = renderWorkspace()
+
+    const vertices = [
+      [40, 50],
+      [140, 50],
+      [140, 110],
+      [90, 80],
+      [40, 110],
+    ]
+    for (const [x, y] of vertices) {
+      fireEvent.pointerDown(surface, { button: 0, pointerId: 22, clientX: x, clientY: y })
+      fireEvent.pointerUp(surface, { pointerId: 22, clientX: x, clientY: y })
+    }
+    expect(restore).not.toHaveBeenCalled()
+    fireEvent.keyDown(window, { key: 'Enter' })
+
+    await waitFor(() => expect(restore).toHaveBeenCalledOnce())
+    expect(restore).toHaveBeenCalledWith(1, 'page', [
+      { x: 30, y: 30 },
+      { x: 130, y: 30 },
+      { x: 130, y: 90 },
+      { x: 80, y: 60 },
+      { x: 30, y: 90 },
+    ])
+  })
+
+  it('cancels a polygon selection with Escape', () => {
+    installProject()
+    useKoharuStore.setState({ tool: 'restore_region' })
+    const restore = vi.spyOn(commands, 'restoreOriginalRegion').mockResolvedValue(2)
+    const surface = renderWorkspace()
+    for (const [x, y] of [
+      [40, 50],
+      [140, 50],
+      [140, 110],
+    ]) {
+      fireEvent.pointerDown(surface, { button: 0, pointerId: 23, clientX: x, clientY: y })
+      fireEvent.pointerUp(surface, { pointerId: 23, clientX: x, clientY: y })
+    }
+    fireEvent.keyDown(window, { key: 'Escape' })
+    fireEvent.keyDown(window, { key: 'Enter' })
+    expect(restore).not.toHaveBeenCalled()
   })
 })

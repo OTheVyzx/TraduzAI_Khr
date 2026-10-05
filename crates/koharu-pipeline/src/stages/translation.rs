@@ -77,7 +77,9 @@ impl StageProcessor for Processor {
             if input
                 .scene
                 .component::<Translation>(entity)?
-                .is_some_and(|value| matches!(value.text.origin, Origin::User))
+                .is_some_and(|value| {
+                    matches!(value.text.origin, Origin::User) && !value.text.value.trim().is_empty()
+                })
             {
                 continue;
             }

@@ -112,6 +112,28 @@ describe('canvas lifecycle', () => {
     expect(order).toEqual(['fetch:first', 'fetch:second', 'install:first', 'install:second'])
   })
 
+  it('keeps the active page frame identity until a same-page update is activated', async () => {
+    const pending = deferred<Uint8Array<ArrayBuffer>>()
+    const element = document.createElement('canvas')
+    const { result, rerender } = renderHook(
+      ({ revision, generation }) => useCanvas(element, revision, generation, 'page'),
+      { initialProps: { revision: 4 as number | null, generation: 7 } },
+    )
+    await waitFor(() => expect(result.current.status).toBe('ready'))
+    expect(result.current.activePage).toBe('page')
+    expect(result.current.activeRevision).toBe(4)
+
+    adapter.fetchManifest.mockImplementationOnce(async () => pending.promise)
+    rerender({ revision: 5, generation: 8 })
+    await waitFor(() => expect(result.current.status).toBe('switching'))
+    expect(result.current.activePage).toBe('page')
+    expect(result.current.activeRevision).toBe(4)
+
+    pending.resolve(new Uint8Array([8]))
+    await waitFor(() => expect(result.current.activeRevision).toBe(5))
+    expect(result.current.activePage).toBe('page')
+  })
+
   it('accepts an authoritative generation without reactivating its prefetched manifest', async () => {
     const element = document.createElement('canvas')
     const { result, rerender } = renderHook(({ generation }) => useCanvas(element, 4, generation), {

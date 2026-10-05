@@ -9,7 +9,7 @@
 
 use anyhow::{Context, Result, bail};
 use fast_image_resize::{FilterType, ResizeAlg, ResizeOptions, Resizer};
-use image::DynamicImage;
+use image::{DynamicImage, GenericImageView};
 use koharu_torch::{Device, IndexOp, Kind, Tensor};
 use serde::{Deserialize, Serialize};
 
@@ -265,24 +265,130 @@ impl ImageSlicer {
         )
     }
 
-    fn get_slice(
-        &self,
-        image: &DynamicImage,
-        slice_number: u32,
-        effective_slice_height: u32,
-        slice_height: u32,
-    ) -> (DynamicImage, u32, u32) {
-        let start_y = slice_number * effective_slice_height;
-        let end_y = if slice_number == image.height().div_ceil(effective_slice_height) - 1 {
-            image.height()
-        } else {
-            (start_y + slice_height).min(image.height())
-        };
+    fn get_slice(&self, image: &DynamicImage, range: (u32, u32)) -> (DynamicImage, u32, u32) {
+        let (start_y, end_y) = range;
         (
             image.crop_imm(0, start_y, image.width(), end_y - start_y),
             start_y,
             end_y,
         )
+    }
+
+    fn slice_ranges(&self, image: &DynamicImage) -> Vec<(u32, u32)> {
+        let (_, slice_height, step, count) = self.calculate_slice_params(image);
+        if count <= 1 {
+            return vec![(0, image.height())];
+        }
+
+        let scores = self.horizontal_activity(image);
+        let search_radius = (slice_height as f32 * self.overlap_height_ratio) as u32;
+        let min_overlap = (slice_height as f32 * 0.05) as u32;
+        let max_overlap = (slice_height as f32 * 0.35) as u32;
+        let min_advance = (slice_height as f32 * 0.55) as u32;
+        let max_advance = slice_height;
+
+        let mut starts: Vec<u32> = Vec::with_capacity(count as usize);
+        starts.push(0);
+        for index in 1..count {
+            let ideal = index * step;
+            let lower = ideal
+                .saturating_sub(search_radius)
+                .max(starts[index as usize - 1].saturating_add(min_advance));
+            let upper = ideal
+                .saturating_add(search_radius)
+                .min(starts[index as usize - 1].saturating_add(max_advance))
+                .min(image.height().saturating_sub(1));
+            starts.push(self.safest_boundary(&scores, ideal, lower, upper));
+        }
+
+        let mut ranges = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            let start = starts[index as usize];
+            let nominal_end = (index * step + slice_height).min(image.height());
+            let end = if index + 1 == count {
+                image.height()
+            } else {
+                let next_start = starts[index as usize + 1];
+                let lower = (start + (slice_height as f32 * self.min_slice_height_ratio) as u32)
+                    .max(next_start.saturating_add(min_overlap));
+                let upper = (start + slice_height + search_radius)
+                    .min(next_start.saturating_add(max_overlap))
+                    .min(image.height());
+                if lower <= upper {
+                    self.safest_boundary(&scores, nominal_end, lower, upper)
+                } else {
+                    nominal_end.min(image.height())
+                }
+            };
+            ranges.push((start, end.max(start + 1).min(image.height())));
+        }
+
+        ranges
+    }
+
+    fn horizontal_activity(&self, image: &DynamicImage) -> Vec<f32> {
+        const SAMPLE_BINS: usize = 16;
+        const MAX_SAMPLES_PER_ROW: u32 = 256;
+        let width = image.width();
+        let sample_step = width.div_ceil(MAX_SAMPLES_PER_ROW).max(1);
+        let mut row_scores = Vec::with_capacity(image.height() as usize);
+
+        // Concentrated ink keeps narrow balloon outlines visible in the seam score.
+        for y in 0..image.height() {
+            let mut bins = [0u32; SAMPLE_BINS];
+            let mut samples = [0u32; SAMPLE_BINS];
+            for x in (0..width).step_by(sample_step as usize) {
+                let bin = ((x as u64 * SAMPLE_BINS as u64) / width.max(1) as u64) as usize;
+                let bin = bin.min(SAMPLE_BINS - 1);
+                samples[bin] += 1;
+                let pixel = image.get_pixel(x, y).0;
+                let luminance = (u32::from(pixel[0]) * 299
+                    + u32::from(pixel[1]) * 587
+                    + u32::from(pixel[2]) * 114)
+                    / 1000;
+                if luminance < 224 {
+                    bins[bin] += 1;
+                }
+            }
+
+            let mut densities = bins
+                .iter()
+                .zip(samples)
+                .filter_map(|(ink, sample_count)| {
+                    (sample_count > 0).then_some(*ink as f32 / sample_count as f32)
+                })
+                .collect::<Vec<_>>();
+            densities.sort_by(f32::total_cmp);
+            let concentrated_ink = densities.iter().rev().take(3).sum::<f32>() / 3.0;
+            row_scores.push(concentrated_ink);
+        }
+
+        let safety_band = (image.width() as f32 * 0.05).round() as usize;
+        let mut prefix = Vec::with_capacity(row_scores.len() + 1);
+        prefix.push(0.0f32);
+        for score in row_scores {
+            prefix.push(prefix.last().copied().unwrap_or_default() + score);
+        }
+        (0..image.height() as usize)
+            .map(|y| {
+                let start = y.saturating_sub(safety_band);
+                let end = (y + safety_band + 1).min(prefix.len() - 1);
+                (prefix[end] - prefix[start]) / (end - start).max(1) as f32
+            })
+            .collect()
+    }
+
+    fn safest_boundary(&self, scores: &[f32], ideal: u32, lower: u32, upper: u32) -> u32 {
+        if lower > upper || scores.is_empty() {
+            return ideal.min(scores.len().saturating_sub(1) as u32);
+        }
+        (lower..=upper.min(scores.len().saturating_sub(1) as u32))
+            .min_by(|left, right| {
+                scores[*left as usize]
+                    .total_cmp(&scores[*right as usize])
+                    .then_with(|| left.abs_diff(ideal).cmp(&right.abs_diff(ideal)))
+            })
+            .unwrap_or_else(|| ideal.min(scores.len().saturating_sub(1) as u32))
     }
 
     fn adjust_box_coordinates(&self, boxes: &mut [[f32; 4]], start_y: u32) {
@@ -382,13 +488,11 @@ impl ImageSlicer {
             return detect(image);
         }
 
-        let (_, slice_height, effective_slice_height, _) = self.calculate_slice_params(image);
-        let num_slices = image.height().div_ceil(effective_slice_height);
-        let (first_slice, _, _) = self.get_slice(image, 0, effective_slice_height, slice_height);
+        let ranges = self.slice_ranges(image);
+        let (first_slice, _, _) = self.get_slice(image, ranges[0]);
         let (mut bubble_boxes, mut text_boxes) = detect(&first_slice)?;
-        for slice_number in 1..num_slices {
-            let (slice, start_y, _) =
-                self.get_slice(image, slice_number, effective_slice_height, slice_height);
+        for range in ranges.iter().skip(1).copied() {
+            let (slice, start_y, _) = self.get_slice(image, range);
             let (mut slice_bubbles, mut slice_texts) = detect(&slice)?;
             self.adjust_box_coordinates(&mut slice_bubbles, start_y);
             self.adjust_box_coordinates(&mut slice_texts, start_y);

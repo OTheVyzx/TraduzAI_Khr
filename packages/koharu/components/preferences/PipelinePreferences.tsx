@@ -48,6 +48,23 @@ export function PipelinePreferences({
       title={t('settings.pipeline.title')}
       description={t('settings.pipeline.description')}
     >
+      <PreferenceSection title={t('settings.pipeline.parallelism')}>
+        <PreferenceRow
+          title={t('settings.pipeline.workers.title')}
+          description={t('settings.pipeline.workers.description')}
+        >
+          <NumberField
+            label={t('settings.pipeline.workers.label')}
+            value={value.page_workers}
+            min={1}
+            max={16}
+            step={1}
+            onChange={(page_workers) =>
+              onChange({ ...value, page_workers: page_workers ?? 1 })
+            }
+          />
+        </PreferenceRow>
+      </PreferenceSection>
       <PreferenceSection title={t('settings.pipeline.processing')}>
         {stages.map(([stage, Icon]) => {
           const model = stageModel(value, stage)

@@ -230,6 +230,13 @@ export function resizeFrame(
   }
 }
 
+export function resizeFontScale(original: Frame, resized: Frame, handle: ResizeHandle): number {
+  const direction = resizeDirections[handle]
+  const width = direction.x ? resized.width / original.width : 1
+  const height = direction.y ? resized.height / original.height : 1
+  return direction.x && direction.y ? Math.sqrt(width * height) : width * height
+}
+
 export function rotateFrame(frame: Frame, start: Point, point: Point): Frame {
   const center = { x: frame.x + frame.width * 0.5, y: frame.y + frame.height * 0.5 }
   const from = { x: start.x - center.x, y: start.y - center.y }
