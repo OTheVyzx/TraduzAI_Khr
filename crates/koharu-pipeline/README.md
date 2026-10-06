@@ -165,11 +165,16 @@ Progress events carry both page and stage:
 - `Started { pages, stages }`
 - `Loading { page, stage, model }`
 - `Running { page, stage, model }`
-- `Finished { page, stage, model, elapsed }`
-- `Skipped { page, stage }`
+- `Finished { page, stage, model, elapsed, timing, commit_elapsed }`
+- `Skipped { page, stage, model, elapsed, timing }`
+- `Failed { page, stage, model, elapsed, timing, commit_elapsed, error }`
 
-`Finished` is emitted after the stage output commits. Progress callbacks are
-isolated from panics and cannot crash execution.
+`elapsed` measures the stage runner, including accelerator wait, model load,
+and page processing. `timing` separates accelerator wait, memory-pressure
+recovery, model load, and processing; `commit_elapsed` measures output commit
+and desktop synchronization. `Finished` is emitted after the stage output
+commits. Skipped stages and failed attempts retain their elapsed timing too.
+Progress callbacks are isolated from panics and cannot crash execution.
 
 ## Source map
 

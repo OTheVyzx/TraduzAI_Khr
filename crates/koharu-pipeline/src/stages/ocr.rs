@@ -1,10 +1,10 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::{StageInput, StageProcessor, finish, generation};
 use crate::{ModelCell, OcrModel, scope::geometry_extents};
 use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
-use image::{DynamicImage, GenericImageView as _, GrayImage, Luma, Rgba, RgbaImage};
+use image::{DynamicImage, GrayImage, Luma, Rgba, RgbaImage};
 use imageproc::drawing::draw_polygon_mut;
 use imageproc::geometric_transformations::{Border, Interpolation, Projection, warp_into};
 use imageproc::point::Point as ImagePoint;
@@ -16,8 +16,10 @@ use koharu_scene::{
     Authored, EntityId, Geometry, LanguageTag, OcrAnalysis, Origin, RecognizedFrom, Region,
     RegionSpec, SourceText, TextDirection, TextRegion,
 };
+use rayon::prelude::*;
 
 const PRODUCER: &str = "dev.koharu.pipeline.ocr";
+const OCR_WORKERS: usize = 4;
 
 pub(super) struct Processor {
     config: OcrModel,
@@ -71,7 +73,7 @@ enum Model {
     Manga(Arc<Mutex<MangaOcr>>),
     Baberu(Arc<Mutex<BaberuOcr>>),
     Hayai(Arc<Mutex<HayaiOcr>>),
-    Paddle(Arc<Mutex<PaddleOCRVLQuantized>>),
+    Paddle(Arc<PaddleOCRVLQuantized>),
 }
 
 impl Model {
@@ -86,9 +88,9 @@ impl Model {
             OcrModel::HayaiOcr => Ok(Self::Hayai(Arc::new(Mutex::new(
                 HayaiOcr::load(device).await?,
             )))),
-            OcrModel::PaddleOcrVl1_6 => Ok(Self::Paddle(Arc::new(Mutex::new(
+            OcrModel::PaddleOcrVl1_6 => Ok(Self::Paddle(Arc::new(
                 PaddleOCRVLQuantized::load(device).await?,
-            )))),
+            ))),
         }
     }
 
@@ -106,6 +108,7 @@ impl Model {
             .get(&input.scene, page, "source")
             .await?
             .ok_or_else(|| anyhow!("page {page} has no source image"))?;
+        let source_rgba = Arc::new(source.to_rgba8());
         for entity in input.scene.descendants(page)? {
             let region = entity.id();
             if !input.contains_entity(region)? {
@@ -121,12 +124,6 @@ impl Model {
                 .scene
                 .component::<Geometry>(region)?
                 .ok_or_else(|| anyhow!("text region {region} has no geometry"))?;
-            let crop = crop(
-                &source,
-                &geometry,
-                matches!(region_data.origin, Origin::User),
-            )
-            .with_context(|| format!("text region {region} is outside its source image"))?;
             for relation in input.scene.relations_to_as::<RecognizedFrom>(region) {
                 let content = relation.value().source;
                 let previous = input.scene.component::<SourceText>(content)?;
@@ -141,36 +138,35 @@ impl Model {
                     region,
                     geometry: geometry.clone(),
                     previous,
-                    image: crop.clone(),
+                    isolate_polygon: matches!(region_data.origin, Origin::User),
+                    image: None,
                 });
             }
         }
 
         let results = match self {
             Self::Manga(model) => {
+                let targets = prepare_targets(source_rgba.as_ref(), targets)?;
                 infer_text(model.clone(), targets, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Baberu(model) => {
+                let targets = prepare_targets(source_rgba.as_ref(), targets)?;
                 infer_text(model.clone(), targets, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
             Self::Hayai(model) => {
+                let targets = prepare_targets(source_rgba.as_ref(), targets)?;
                 infer_text(model.clone(), targets, |model, image| {
                     model.inference(image)
                 })
                 .await?
             }
-            Self::Paddle(model) => {
-                infer_text(model.clone(), targets, |model, image| {
-                    Ok(model.inference(image, PaddleOCRVLTask::Ocr)?.text)
-                })
-                .await?
-            }
+            Self::Paddle(model) => infer_paddle_text(model.clone(), source_rgba, targets).await?,
         };
 
         let generation = generation(PRODUCER, model_name)?;
@@ -212,7 +208,8 @@ struct OcrTarget {
     region: EntityId,
     geometry: Geometry,
     previous: Option<SourceText>,
-    image: DynamicImage,
+    isolate_polygon: bool,
+    image: Option<DynamicImage>,
 }
 
 struct OcrResult {
@@ -240,12 +237,54 @@ async fn infer_text<M: Send + 'static>(
                     region: target.region,
                     geometry: target.geometry,
                     previous: target.previous,
-                    text: normalize_ocr_text(inference(&model, &target.image)?),
+                    text: normalize_ocr_text(inference(
+                        &model,
+                        target
+                            .image
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("OCR crop was not prepared"))?,
+                    )?),
                 })
             })
             .collect()
     })
     .await
+}
+
+fn prepare_targets(source: &RgbaImage, targets: Vec<OcrTarget>) -> Result<Vec<OcrTarget>> {
+    targets
+        .into_iter()
+        .map(|mut target| {
+            target.image = Some(
+                crop_rgba(source, &target.geometry, target.isolate_polygon).with_context(|| {
+                    format!("text region {} is outside its source image", target.region)
+                })?,
+            );
+            Ok(target)
+        })
+        .collect()
+}
+
+async fn infer_paddle_text(
+    model: Arc<PaddleOCRVLQuantized>,
+    source: Arc<RgbaImage>,
+    targets: Vec<OcrTarget>,
+) -> Result<Vec<OcrResult>> {
+    tokio::task::spawn_blocking(move || {
+        parallel_map_ordered(targets, |target| {
+            let image = crop_rgba(&source, &target.geometry, target.isolate_polygon).with_context(
+                || format!("text region {} is outside its source image", target.region),
+            )?;
+            Ok(OcrResult {
+                content: target.content,
+                region: target.region,
+                geometry: target.geometry,
+                previous: target.previous,
+                text: normalize_ocr_text(model.inference(&image, PaddleOCRVLTask::Ocr)?.text),
+            })
+        })
+    })
+    .await?
 }
 
 // Manga OCR can emit replacement-box glyphs for an isolated Japanese ellipsis.
@@ -284,7 +323,32 @@ fn text_direction(geometry: &Geometry) -> Result<TextDirection> {
     })
 }
 
-fn crop(source: &DynamicImage, geometry: &Geometry, isolate_polygon: bool) -> Result<DynamicImage> {
+fn ocr_pool() -> Result<&'static rayon::ThreadPool> {
+    static OCR_POOL: OnceLock<std::result::Result<rayon::ThreadPool, String>> = OnceLock::new();
+    match OCR_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(OCR_WORKERS)
+            .thread_name(|index| format!("koharu-ocr-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(pool) => Ok(pool),
+        Err(error) => Err(anyhow!("failed to create OCR worker pool: {error}")),
+    }
+}
+
+fn parallel_map_ordered<T: Send, R: Send>(
+    values: Vec<T>,
+    map: impl Fn(T) -> Result<R> + Send + Sync,
+) -> Result<Vec<R>> {
+    ocr_pool()?.install(|| values.into_par_iter().map(map).collect())
+}
+
+fn crop_rgba(
+    source: &RgbaImage,
+    geometry: &Geometry,
+    isolate_polygon: bool,
+) -> Result<DynamicImage> {
     let (min_x, min_y, max_x, max_y) =
         geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
     let isolated = isolate_polygon.then(|| isolate_polygon_pixels(source, geometry));
@@ -300,6 +364,117 @@ fn crop(source: &DynamicImage, geometry: &Geometry, isolate_polygon: bool) -> Re
             let output_width = (width + margin * 2.0).ceil() as u32;
             let output_height = (height + margin * 2.0).ceil() as u32;
             // Malformed model geometry must never allocate an unbounded OCR image.
+            if output_width <= source.width().saturating_mul(2)
+                && output_height <= source.height().saturating_mul(2)
+            {
+                let from =
+                    std::array::from_fn(|index| (points[index].x as f32, points[index].y as f32));
+                let margin = margin as f32;
+                let to = [
+                    (margin, margin),
+                    (margin + width as f32, margin),
+                    (margin + width as f32, margin + height as f32),
+                    (margin, margin + height as f32),
+                ];
+                if let Some(projection) = Projection::from_control_points(from, to) {
+                    let mut output = RgbaImage::from_pixel(
+                        output_width,
+                        output_height,
+                        Rgba([255, 255, 255, 255]),
+                    );
+                    warp_into(
+                        source,
+                        projection,
+                        Interpolation::Bilinear,
+                        Border::Constant(Rgba([255, 255, 255, 255])),
+                        &mut output,
+                    );
+                    return Ok(DynamicImage::ImageRgba8(output));
+                }
+            }
+        }
+    }
+    let margin = ((max_x - min_x).min(max_y - min_y) * 0.08).clamp(2.0, 12.0);
+    let x = (min_x - margin).floor().max(0.0) as u32;
+    let y = (min_y - margin).floor().max(0.0) as u32;
+    let right = (max_x + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.width())) as u32;
+    let bottom = (max_y + margin)
+        .ceil()
+        .max(0.0)
+        .min(f64::from(source.height())) as u32;
+    if right <= x || bottom <= y {
+        bail!("geometry does not overlap the image");
+    }
+    Ok(DynamicImage::ImageRgba8(
+        image::imageops::crop_imm(source, x, y, right - x, bottom - y).to_image(),
+    ))
+}
+
+fn convex_quad(points: &[koharu_scene::Point]) -> bool {
+    let mut sign = 0.0_f64;
+    for index in 0..4 {
+        let a = points[index];
+        let b = points[(index + 1) % 4];
+        let c = points[(index + 2) % 4];
+        let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if cross.abs() < 1e-9 || (sign != 0.0 && sign.signum() != cross.signum()) {
+            return false;
+        }
+        sign = cross;
+    }
+    true
+}
+
+fn isolate_polygon_pixels(source: &RgbaImage, geometry: &Geometry) -> RgbaImage {
+    let (width, height) = source.dimensions();
+    let mut mask = GrayImage::new(width, height);
+    let points = geometry
+        .points
+        .iter()
+        .map(|point| ImagePoint::new(point.x.round() as i32, point.y.round() as i32))
+        .collect::<Vec<_>>();
+    draw_polygon_mut(&mut mask, &points, Luma([255]));
+    let mut isolated = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+    if let Some((min_x, min_y, max_x, max_y)) = geometry_extents(geometry) {
+        let first_x = min_x.floor().max(0.0) as u32;
+        let first_y = min_y.floor().max(0.0) as u32;
+        let last_x = max_x.ceil().min(f64::from(width)) as u32;
+        let last_y = max_y.ceil().min(f64::from(height)) as u32;
+        for y in first_y..last_y {
+            for x in first_x..last_x {
+                if mask.get_pixel(x, y).0[0] != 0 {
+                    isolated.put_pixel(x, y, *source.get_pixel(x, y));
+                }
+            }
+        }
+    }
+    isolated
+}
+
+#[cfg(test)]
+fn legacy_crop(
+    source: &DynamicImage,
+    geometry: &Geometry,
+    isolate_polygon: bool,
+) -> Result<DynamicImage> {
+    let (min_x, min_y, max_x, max_y) =
+        geometry_extents(geometry).ok_or_else(|| anyhow!("geometry is empty"))?;
+    let isolated = isolate_polygon
+        .then(|| DynamicImage::ImageRgba8(isolate_polygon_pixels(&source.to_rgba8(), geometry)));
+    let source = isolated.as_ref().unwrap_or(source);
+    if geometry.points.len() == 4 && convex_quad(&geometry.points) {
+        let points = &geometry.points;
+        let edge =
+            |a: usize, b: usize| (points[a].x - points[b].x).hypot(points[a].y - points[b].y);
+        let width = edge(0, 1).max(edge(2, 3));
+        let height = edge(1, 2).max(edge(3, 0));
+        if width.is_finite() && height.is_finite() && width >= 1.0 && height >= 1.0 {
+            let margin = (width.min(height) * 0.08).clamp(2.0, 12.0);
+            let output_width = (width + margin * 2.0).ceil() as u32;
+            let output_height = (height + margin * 2.0).ceil() as u32;
             if output_width <= source.width().saturating_mul(2)
                 && output_height <= source.height().saturating_mul(2)
             {
@@ -347,50 +522,9 @@ fn crop(source: &DynamicImage, geometry: &Geometry, isolate_polygon: bool) -> Re
     Ok(source.crop_imm(x, y, right - x, bottom - y))
 }
 
-fn convex_quad(points: &[koharu_scene::Point]) -> bool {
-    let mut sign = 0.0_f64;
-    for index in 0..4 {
-        let a = points[index];
-        let b = points[(index + 1) % 4];
-        let c = points[(index + 2) % 4];
-        let cross = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
-        if cross.abs() < 1e-9 || (sign != 0.0 && sign.signum() != cross.signum()) {
-            return false;
-        }
-        sign = cross;
-    }
-    true
-}
-
-fn isolate_polygon_pixels(source: &DynamicImage, geometry: &Geometry) -> DynamicImage {
-    let (width, height) = source.dimensions();
-    let mut mask = GrayImage::new(width, height);
-    let points = geometry
-        .points
-        .iter()
-        .map(|point| ImagePoint::new(point.x.round() as i32, point.y.round() as i32))
-        .collect::<Vec<_>>();
-    draw_polygon_mut(&mut mask, &points, Luma([255]));
-    let mut isolated = RgbaImage::from_pixel(width, height, Rgba([255, 255, 255, 255]));
-    if let Some((min_x, min_y, max_x, max_y)) = geometry_extents(geometry) {
-        let first_x = min_x.floor().max(0.0) as u32;
-        let first_y = min_y.floor().max(0.0) as u32;
-        let last_x = max_x.ceil().min(f64::from(width)) as u32;
-        let last_y = max_y.ceil().min(f64::from(height)) as u32;
-        for y in first_y..last_y {
-            for x in first_x..last_x {
-                if mask.get_pixel(x, y).0[0] != 0 {
-                    isolated.put_pixel(x, y, source.get_pixel(x, y));
-                }
-            }
-        }
-    }
-    DynamicImage::ImageRgba8(isolated)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{crop, normalize_ocr_text, text_direction};
+    use super::{crop_rgba, legacy_crop, normalize_ocr_text, parallel_map_ordered, text_direction};
     use image::{DynamicImage, Rgba, RgbaImage};
     use koharu_scene::{Geometry, Origin, Point, TextDirection};
 
@@ -407,7 +541,7 @@ mod tests {
             ],
         };
 
-        let result = crop(&source, &geometry, false).unwrap();
+        let result = legacy_crop(&source, &geometry, false).unwrap();
         assert!(result.width() > result.height());
         assert!(result.width() >= 20);
         assert!(result.height() >= 9);
@@ -415,6 +549,55 @@ mod tests {
             text_direction(&geometry).unwrap(),
             TextDirection::Horizontal
         );
+    }
+
+    #[test]
+    fn reusing_page_rgba_keeps_the_existing_crop_pixels() {
+        let source = DynamicImage::ImageRgba8(RgbaImage::from_fn(40, 36, |x, y| {
+            Rgba([x as u8, y as u8, (x + y) as u8, 255])
+        }));
+        let rgba = source.to_rgba8();
+        let geometries = [
+            Geometry {
+                origin: Origin::User,
+                points: vec![
+                    Point { x: 4.0, y: 6.0 },
+                    Point { x: 27.0, y: 8.0 },
+                    Point { x: 25.0, y: 19.0 },
+                    Point { x: 2.0, y: 16.0 },
+                ],
+            },
+            Geometry {
+                origin: Origin::User,
+                points: vec![
+                    Point { x: 5.0, y: 5.0 },
+                    Point { x: 30.0, y: 5.0 },
+                    Point { x: 18.0, y: 29.0 },
+                ],
+            },
+        ];
+
+        for geometry in geometries {
+            let expected = legacy_crop(&source, &geometry, matches!(geometry.origin, Origin::User))
+                .unwrap()
+                .to_rgba8();
+            let actual = crop_rgba(&rgba, &geometry, matches!(geometry.origin, Origin::User))
+                .unwrap()
+                .to_rgba8();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn parallel_ocr_work_keeps_regions_in_reading_order() {
+        let output = parallel_map_ordered(vec![3, 1, 4, 1, 5, 9], |value| Ok(value * 10)).unwrap();
+        assert_eq!(output, [30, 10, 40, 10, 50, 90]);
+    }
+
+    #[test]
+    fn quantized_paddle_model_supports_shared_parallel_reads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::PaddleOCRVLQuantized>();
     }
 
     #[test]
@@ -428,7 +611,7 @@ mod tests {
                 Point { x: 2.0, y: 10.0 },
             ],
         };
-        let selected = crop(&source, &geometry, true).unwrap().to_rgba8();
+        let selected = legacy_crop(&source, &geometry, true).unwrap().to_rgba8();
         assert_eq!(selected.get_pixel(3, 3).0, [0, 0, 0, 255]);
         assert_eq!(selected.get_pixel(8, 8).0, [255, 255, 255, 255]);
 
@@ -445,7 +628,7 @@ mod tests {
                 Point { x: 0.0, y: 12.0 },
             ],
         };
-        let selected = crop(&source, &concave, true).unwrap().to_rgba8();
+        let selected = legacy_crop(&source, &concave, true).unwrap().to_rgba8();
         assert_eq!(selected.get_pixel(3, 9).0, [0, 0, 0, 255]);
         assert_eq!(selected.get_pixel(6, 9).0, [255, 255, 255, 255]);
     }

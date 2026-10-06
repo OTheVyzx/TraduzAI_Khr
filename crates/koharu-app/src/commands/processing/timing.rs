@@ -19,7 +19,24 @@ pub(super) struct PipelineTimingRecord {
     pub(super) stage_count: usize,
     pub(super) completed_steps: usize,
     pub(super) total_steps: usize,
+    pub(super) page_stages: Vec<PageStageTiming>,
     pub(super) error: Option<String>,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct PageStageTiming {
+    pub(super) page_number: Option<usize>,
+    pub(super) page_id: String,
+    pub(super) stage: koharu_pipeline::Stage,
+    pub(super) model: Option<String>,
+    pub(super) outcome: String,
+    pub(super) duration_ms: u128,
+    pub(super) accelerator_wait_ms: u128,
+    pub(super) recovery_ms: u128,
+    pub(super) model_load_ms: u128,
+    pub(super) process_ms: u128,
+    pub(super) commit_ms: u128,
+    pub(super) other_ms: u128,
 }
 
 pub(super) fn append_record(path: &Path, record: &PipelineTimingRecord) -> io::Result<()> {
@@ -54,6 +71,20 @@ mod tests {
             stage_count: 1,
             completed_steps: 26,
             total_steps: 26,
+            page_stages: vec![PageStageTiming {
+                page_number: Some(10),
+                page_id: "page-10".into(),
+                stage: koharu_pipeline::Stage::Detection,
+                model: Some("detector".into()),
+                outcome: "completed".into(),
+                duration_ms: 1_250,
+                accelerator_wait_ms: 100,
+                recovery_ms: 0,
+                model_load_ms: 200,
+                process_ms: 800,
+                commit_ms: 50,
+                other_ms: 100,
+            }],
             error: None,
         };
 
@@ -68,5 +99,11 @@ mod tests {
         assert_eq!(saved["wall_duration_ms"], 12_345);
         assert_eq!(saved["page_count"], 26);
         assert_eq!(saved["stage_count"], 1);
+        assert_eq!(saved["page_stages"][0]["page_number"], 10);
+        assert_eq!(saved["page_stages"][0]["stage"], "detection");
+        assert_eq!(saved["page_stages"][0]["duration_ms"], 1_250);
+        assert_eq!(saved["page_stages"][0]["model_load_ms"], 200);
+        assert_eq!(saved["page_stages"][0]["process_ms"], 800);
+        assert_eq!(saved["page_stages"][0]["commit_ms"], 50);
     }
 }

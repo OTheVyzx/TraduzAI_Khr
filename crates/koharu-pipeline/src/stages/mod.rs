@@ -9,6 +9,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use koharu_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
 
+pub(crate) use detection::DETECTION_BATCH_SIZE;
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
 pub use inpainting::{Flux2KleinConfig, RoremMixedConfig};
 
@@ -115,6 +116,20 @@ impl Stages {
         self.processor(stage).process(input).await
     }
 
+    pub(crate) async fn prepare_detection_batch(
+        &self,
+        inputs: Vec<StageInput>,
+    ) -> Result<Vec<detection::PreparedPage>> {
+        self.detection.prepare_batch(inputs).await
+    }
+
+    pub(crate) async fn process_prepared_detection_batch(
+        &self,
+        prepared: Vec<detection::PreparedPage>,
+    ) -> Result<Vec<Patch>> {
+        self.detection.process_prepared_batch(prepared).await
+    }
+
     pub(crate) fn unload(&self, stage: Stage) -> bool {
         self.processor(stage).unload()
     }
@@ -165,8 +180,8 @@ mod tests {
             [
                 "koharu-layout-rfdetr-seg-2xl",
                 "paddleocr-vl-1.6",
-                "local",
                 "lama",
+                "local",
             ]
         );
     }

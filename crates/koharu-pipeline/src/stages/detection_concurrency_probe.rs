@@ -271,6 +271,30 @@ async fn chapter_detection_concurrency() -> Result<()> {
             fixed: false,
             whole_stage_lock: false,
         },
+        Mode {
+            name: "rolling6",
+            workers: 6,
+            fixed: false,
+            whole_stage_lock: false,
+        },
+        Mode {
+            name: "rolling8",
+            workers: 8,
+            fixed: false,
+            whole_stage_lock: false,
+        },
+        Mode {
+            name: "rolling6-repeat",
+            workers: 6,
+            fixed: false,
+            whole_stage_lock: false,
+        },
+        Mode {
+            name: "rolling8-repeat",
+            workers: 8,
+            fixed: false,
+            whole_stage_lock: false,
+        },
     ];
     let selected = std::env::var("DETECT_PROBE_MODES")
         .unwrap_or_else(|_| modes.iter().map(|m| m.name).collect::<Vec<_>>().join(","));

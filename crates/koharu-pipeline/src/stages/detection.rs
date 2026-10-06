@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::{BTreeMap, VecDeque},
     io::Cursor,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -19,7 +19,7 @@ use imageproc::{
 };
 use koharu_ml::koharu_layout_rfdetr_seg_2xl::{
     KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask, KoharuLayoutRFDetrSeg2XL,
-    KoharuLayoutThresholds,
+    KoharuLayoutThresholds, PreparedKoharuLayoutImage,
 };
 use koharu_scene::{
     AssetInput, AssetMetadata, AssetRole, At, BubbleRegion, DetectionAnalysis, DetectionLabel,
@@ -37,10 +37,14 @@ use crate::{DetectionModel, ModelCell};
 const MODEL_ID: &str = "mayocream/koharu-layout-rfdetr-seg-2xl-1152";
 
 #[cfg(test)]
+#[path = "detection_batch_probe.rs"]
+mod batch_probe;
+#[cfg(test)]
 #[path = "detection_concurrency_probe.rs"]
 mod concurrency_probe;
 const MODEL_NAME: &str = "koharu-layout-rfdetr-seg-2xl";
 const PRODUCER: &str = "dev.koharu.pipeline.detection";
+pub(crate) const DETECTION_BATCH_SIZE: usize = 4;
 const ANGLE_SNAP_DEGREES: f32 = 3.0;
 const ANGLE_SEARCH_HALF_STEPS: i32 = 90;
 const ANGLE_SEARCH_STEP_DEGREES: f64 = 0.5;
@@ -95,6 +99,69 @@ impl Processor {
             model: ModelCell::new(),
         }
     }
+
+    pub(crate) async fn prepare_batch(&self, inputs: Vec<StageInput>) -> Result<Vec<PreparedPage>> {
+        let pages = futures::future::try_join_all(inputs.into_iter().map(|input| async move {
+            let page = input.page;
+            let image = input
+                .images
+                .get(&input.scene, page, "source")
+                .await?
+                .ok_or_else(|| anyhow!("page {page} has no source image"))?;
+            Ok::<_, anyhow::Error>((input, image))
+        }))
+        .await?;
+        tokio::task::spawn_blocking(move || {
+            detection_prepare_pool()?.install(|| {
+                pages
+                    .into_par_iter()
+                    .map(|(input, image)| {
+                        let prepared = KoharuLayoutRFDetrSeg2XL::prepare(&image, 1152)?;
+                        Ok(PreparedPage {
+                            input,
+                            image,
+                            prepared,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+        })
+        .await?
+    }
+
+    pub(crate) async fn process_prepared_batch(
+        &self,
+        prepared: Vec<PreparedPage>,
+    ) -> Result<Vec<koharu_scene::Patch>> {
+        let (network, thresholds) = {
+            let guard = self.model.lock().await;
+            let model = guard
+                .as_ref()
+                .ok_or_else(|| anyhow!("detection model is not loaded"))?;
+            (model.network.clone(), model.thresholds)
+        };
+        let mut page_info = Vec::with_capacity(prepared.len());
+        let mut inference_inputs = Vec::with_capacity(prepared.len());
+        for page in prepared {
+            page_info.push((page.input, page.image));
+            inference_inputs.push(page.prepared);
+        }
+        let (page_info, outputs) = tokio_rayon::spawn(move || {
+            let network = network
+                .lock()
+                .map_err(|_| anyhow!("layout model lock is poisoned"))?;
+            let outputs =
+                network.inference_prepared_batch_with_thresholds(&inference_inputs, thresholds)?;
+            Ok::<_, anyhow::Error>((page_info, outputs))
+        })
+        .await?;
+        let generation = generation(PRODUCER, MODEL_ID)?;
+        let mut patches = Vec::with_capacity(page_info.len());
+        for ((input, image), output) in page_info.into_iter().zip(outputs) {
+            patches.push(build_patch(&input, &image, output, &generation).await?);
+        }
+        Ok(patches)
+    }
 }
 
 #[async_trait]
@@ -135,6 +202,28 @@ impl StageProcessor for Processor {
             .ok_or_else(|| anyhow!("detection model is not loaded"))?
             .run(input)
             .await
+    }
+}
+
+pub(crate) struct PreparedPage {
+    input: StageInput,
+    image: Arc<DynamicImage>,
+    prepared: PreparedKoharuLayoutImage,
+}
+
+fn detection_prepare_pool() -> Result<&'static rayon::ThreadPool> {
+    static PREP_POOL: OnceLock<std::result::Result<rayon::ThreadPool, String>> = OnceLock::new();
+    match PREP_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(DETECTION_BATCH_SIZE)
+            .thread_name(|index| format!("koharu-detect-prep-{index}"))
+            .build()
+            .map_err(|error| error.to_string())
+    }) {
+        Ok(pool) => Ok(pool),
+        Err(error) => Err(anyhow!(
+            "failed to create detection preparation pool: {error}"
+        )),
     }
 }
 

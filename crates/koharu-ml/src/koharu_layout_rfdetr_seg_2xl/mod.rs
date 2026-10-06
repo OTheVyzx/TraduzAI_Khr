@@ -11,11 +11,11 @@ mod processor;
 
 use anyhow::{Context, Result, ensure};
 use image::DynamicImage;
-use koharu_torch::Device;
+use koharu_torch::{Device, Tensor};
 
 use crate::backend::TryIntoDevice;
 
-use self::processor::{map_detection_to_page, pad_tile, plan_tiles};
+use self::processor::{InferenceTile, map_detection_to_page, pad_tile, plan_tiles};
 pub use self::{
     config::{KoharuLayoutRFDetrSeg2XLConfig, KoharuLayoutThresholds},
     processor::{
@@ -24,7 +24,18 @@ pub use self::{
     },
 };
 
-use self::model::Model;
+use self::model::{Model, Output};
+
+/// CPU-prepared source page for grouped RF-DETR inference.
+///
+/// This is exposed so callers can prepare upcoming pages while the accelerator
+/// processes the current batch. The stored tile pixels remain on the CPU.
+pub struct PreparedKoharuLayoutImage {
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    tiles: Vec<(InferenceTile, image::RgbImage)>,
+}
 
 crate::model_repository!("mayocream/koharu-layout-rfdetr-seg-2xl-1152" @ "aed55fdb8ca953c6bec33cf6ed6dd52a9b72bfa2" {
     CONFIG = "inference_config.json",
@@ -101,6 +112,110 @@ impl KoharuLayoutRFDetrSeg2XL {
                 detections,
             })
         })
+    }
+
+    /// Decodes the page into RGB and creates its padded inference tiles on CPU.
+    pub fn prepare(image: &DynamicImage, tile_size: u32) -> Result<PreparedKoharuLayoutImage> {
+        let width = image.width();
+        let height = image.height();
+        ensure!(width > 0 && height > 0, "cannot segment an empty image");
+        ensure!(tile_size > 0, "tile size must be positive");
+        let source = image.to_rgb8();
+        let tiles = plan_tiles(width, height, tile_size)
+            .into_iter()
+            .map(|tile| (tile, pad_tile(&source, tile, tile_size)))
+            .collect();
+        Ok(PreparedKoharuLayoutImage {
+            width,
+            height,
+            tile_size,
+            tiles,
+        })
+    }
+
+    /// Runs one model forward pass for the next compatible tile from each page.
+    ///
+    /// Prepared pages may have different tile counts. Each iteration batches
+    /// the tile at the same index from all pages that still have one.
+    pub fn inference_prepared_batch_with_thresholds(
+        &self,
+        images: &[PreparedKoharuLayoutImage],
+        thresholds: KoharuLayoutThresholds,
+    ) -> Result<Vec<KoharuLayoutDetections>> {
+        ensure!(!images.is_empty(), "cannot infer an empty page batch");
+        koharu_torch::no_grad(|| {
+            let resolution = self.processor.resolution();
+            ensure!(
+                images.iter().all(|image| image.tile_size == resolution),
+                "prepared pages use a different tile size than the loaded detector"
+            );
+            let max_tiles = images
+                .iter()
+                .map(|image| image.tiles.len())
+                .max()
+                .unwrap_or(0);
+            let mut page_detections = (0..images.len())
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<KoharuLayoutDetection>>>();
+
+            for tile_index in 0..max_tiles {
+                let mut pixel_values = Vec::with_capacity(images.len());
+                let mut owners = Vec::with_capacity(images.len());
+                for (page_index, image) in images.iter().enumerate() {
+                    if let Some((tile, tile_image)) = image.tiles.get(tile_index) {
+                        let tile_image = DynamicImage::ImageRgb8(tile_image.clone());
+                        pixel_values.push(self.processor.preprocess(&tile_image, self.device)?);
+                        owners.push((page_index, *tile));
+                    }
+                }
+                if pixel_values.is_empty() {
+                    continue;
+                }
+
+                let batch = Tensor::cat(&pixel_values, 0);
+                let output = self.model.forward(&batch);
+                for (batch_index, (page_index, tile)) in owners.into_iter().enumerate() {
+                    let batch_index = batch_index as i64;
+                    let item = Output {
+                        pred_logits: output.pred_logits.narrow(0, batch_index, 1),
+                        pred_boxes: output.pred_boxes.narrow(0, batch_index, 1),
+                        pred_masks: output.pred_masks.narrow(0, batch_index, 1),
+                    };
+                    let tile_output = self
+                        .processor
+                        .postprocess(&item, resolution, resolution, thresholds)?;
+                    let page = &images[page_index];
+                    page_detections[page_index].extend(
+                        tile_output.detections.into_iter().filter_map(|detection| {
+                            map_detection_to_page(detection, tile, page.width, page.height)
+                        }),
+                    );
+                }
+            }
+
+            Ok(images
+                .iter()
+                .zip(page_detections)
+                .map(|(image, detections)| KoharuLayoutDetections {
+                    image_width: image.width,
+                    image_height: image.height,
+                    detections,
+                })
+                .collect())
+        })
+    }
+
+    /// Convenience path that prepares pages and then runs grouped inference.
+    pub fn inference_batch_with_thresholds(
+        &self,
+        images: &[DynamicImage],
+        thresholds: KoharuLayoutThresholds,
+    ) -> Result<Vec<KoharuLayoutDetections>> {
+        let prepared = images
+            .iter()
+            .map(|image| Self::prepare(image, self.processor.resolution()))
+            .collect::<Result<Vec<_>>>()?;
+        self.inference_prepared_batch_with_thresholds(&prepared, thresholds)
     }
 
     pub fn recommended_thresholds(&self) -> KoharuLayoutThresholds {

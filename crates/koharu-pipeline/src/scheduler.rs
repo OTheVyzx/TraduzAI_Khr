@@ -47,9 +47,31 @@ impl Scheduler {
     }
 
     pub(crate) fn start_next(&mut self) -> Option<(EntityId, Stage)> {
+        self.start_next_with_limit(self.page_workers)
+    }
+
+    pub(crate) fn start_next_batch(
+        &mut self,
+        batch_limit: usize,
+        active_limit: usize,
+    ) -> Vec<(EntityId, Stage)> {
+        let mut batch = Vec::with_capacity(batch_limit);
+        while batch.len() < batch_limit {
+            let Some(job) = self.start_next_with_limit(active_limit) else {
+                break;
+            };
+            batch.push(job);
+        }
+        batch
+    }
+
+    pub(crate) fn start_next_with_limit(
+        &mut self,
+        active_limit: usize,
+    ) -> Option<(EntityId, Stage)> {
         loop {
             let stage = *self.stages.get(self.stage_index)?;
-            if self.active_workers >= self.page_workers {
+            if self.active_workers >= active_limit.max(1) {
                 return None;
             }
 
@@ -152,5 +174,30 @@ mod tests {
         let mut empty = Scheduler::new(&[], &stages, 2);
         assert_eq!(empty.start_next(), None);
         assert_eq!(empty.total(), 0);
+    }
+
+    #[test]
+    fn detection_lookahead_can_reserve_two_bounded_page_batches() {
+        let pages = pages(8);
+        let stages = [Stage::Detection, Stage::Ocr];
+        let mut scheduler = Scheduler::new(&pages, &stages, 4);
+
+        let first = scheduler.start_next_batch(4, 8);
+        let second = scheduler.start_next_batch(4, 8);
+
+        assert_eq!(first.len(), 4);
+        assert_eq!(second.len(), 4);
+        assert!(
+            first
+                .iter()
+                .chain(&second)
+                .all(|(_, stage)| *stage == Stage::Detection)
+        );
+        assert_eq!(scheduler.start_next_batch(4, 8).len(), 0);
+
+        for (page, stage) in first.into_iter().chain(second) {
+            assert!(!scheduler.complete_stage(page, stage));
+        }
+        assert_eq!(scheduler.start_next_batch(4, 8).len(), 4);
     }
 }

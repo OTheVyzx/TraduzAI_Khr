@@ -586,10 +586,19 @@ impl Transformer {
             .max_dim(-1, false)
             .0
             .topk(NUM_QUERIES, 1, true, true)
-            .1
-            .i(0);
-        let selected_memory = encoded_memory.i(0).index_select(0, &topk).unsqueeze(0);
-        let selected_proposals = output_proposals.i(0).index_select(0, &topk).unsqueeze(0);
+            .1;
+        let selected_memory = encoded_memory.gather(
+            1,
+            &topk.unsqueeze(-1).repeat([1, 1, encoded_memory.size()[2]]),
+            false,
+        );
+        let selected_proposals = output_proposals.gather(
+            1,
+            &topk
+                .unsqueeze(-1)
+                .repeat([1, 1, output_proposals.size()[2]]),
+            false,
+        );
         // The encoder box MLP is token-pointwise. Latest upstream gathers ranked
         // tokens first instead of evaluating and discarding every unselected box.
         let delta = encoder.bbox_embed.forward(&selected_memory);
@@ -602,7 +611,10 @@ impl Transformer {
             -1,
         );
 
-        let learned_refpoints = refpoint_embed.unsqueeze(0);
+        let batch_size = feature_size[0];
+        let learned_refpoints = refpoint_embed
+            .unsqueeze(0)
+            .expand([batch_size, -1, -1], false);
         let references = Tensor::cat(
             &[
                 learned_refpoints.i((.., .., 0..2)) * topk_boxes.i((.., .., 2..4))
@@ -611,7 +623,7 @@ impl Transformer {
             ],
             -1,
         );
-        let target = query_feat.unsqueeze(0);
+        let target = query_feat.unsqueeze(0).expand([batch_size, -1, -1], false);
         let hs = self
             .decoder
             .forward(&target, &memory, &position, &references, (height, width));
@@ -926,7 +938,10 @@ fn generate_encoder_output_proposals(memory: &Tensor, height: i64, width: i64) -
         .to_device(memory.device())
         .to_kind(memory.kind())
         .view([1, 1, 2]);
-    let grid = (grid.unsqueeze(0) + 0.5) / scale;
+    let batch_size = memory.size()[0];
+    let grid = ((grid.unsqueeze(0) + 0.5) / scale)
+        .reshape([1, height * width, 2])
+        .expand([batch_size, height * width, 2], false);
     let wh = Tensor::ones_like(&grid) * 0.05;
     let proposals = Tensor::cat(&[grid, wh], -1).reshape([memory.size()[0], height * width, 4]);
     let valid = proposals

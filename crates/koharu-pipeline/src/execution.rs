@@ -94,18 +94,33 @@ impl<'a> Execution<'a> {
         self.resources.start();
         self.resources.wait_for_sample().await;
 
-        let runner = self.runner.clone();
         let mut running = FuturesUnordered::new();
         loop {
             while let Some(job) = self.take_ready_job() {
-                let runner = runner.clone();
-                running.push(tokio::spawn(async move { runner.run(job).await }));
+                if job.stage() == Stage::Detection {
+                    let batch_size = self.runner.detection_batch_size();
+                    let active_limit = batch_size.saturating_mul(2);
+                    let mut first = vec![job];
+                    first.extend(self.take_ready_jobs(batch_size.saturating_sub(1), active_limit));
+                    let second = self.take_ready_jobs(batch_size, active_limit);
+                    let runner = self.runner.clone();
+                    let mut batches = vec![first];
+                    if !second.is_empty() {
+                        batches.push(second);
+                    }
+                    running.push(tokio::spawn(async move {
+                        runner.run_detection_batches(batches).await
+                    }));
+                } else {
+                    let runner = self.runner.clone();
+                    running.push(tokio::spawn(async move { vec![runner.run(job).await] }));
+                }
             }
 
             let Some(completion) = running.next().await else {
                 break;
             };
-            let completion = match completion {
+            let completions = match completion {
                 Ok(completion) => completion,
                 Err(error) => {
                     self.failure = Some(PipelineError::new(
@@ -116,11 +131,13 @@ impl<'a> Execution<'a> {
                     continue;
                 }
             };
-            if self.stopped() || self.failure.is_some() {
-                continue;
-            }
-            if let Err(error) = self.apply_completion(completion).await {
-                self.failure = Some(error);
+            for completion in completions {
+                if self.stopped() || self.failure.is_some() {
+                    continue;
+                }
+                if let Err(error) = self.apply_completion(completion).await {
+                    self.failure = Some(error);
+                }
             }
         }
 
@@ -132,12 +149,27 @@ impl<'a> Execution<'a> {
             return None;
         }
         let (page, stage) = self.scheduler.start_next()?;
+        Some(self.make_job(page, stage))
+    }
+
+    fn take_ready_jobs(&mut self, batch_limit: usize, active_limit: usize) -> Vec<StageJob> {
+        if self.stopped() || self.failure.is_some() {
+            return Vec::new();
+        }
+        self.scheduler
+            .start_next_batch(batch_limit, active_limit)
+            .into_iter()
+            .map(|(page, stage)| self.make_job(page, stage))
+            .collect()
+    }
+
+    fn make_job(&mut self, page: EntityId, stage: Stage) -> StageJob {
         let images = self
             .images
             .entry(page)
             .or_insert_with(|| Arc::new(ImageCache::default()))
             .clone();
-        Some(StageJob::new(
+        StageJob::new(
             stage,
             StageInput::new(
                 self.scene.clone(),
@@ -152,7 +184,7 @@ impl<'a> Execution<'a> {
             ),
             self.stop.clone(),
             self.progress.clone(),
-        ))
+        )
     }
 
     async fn apply_completion(
@@ -164,18 +196,63 @@ impl<'a> Execution<'a> {
             stage,
             model,
             elapsed,
+            timing,
             outcome,
         } = completion;
-        match outcome? {
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                progress::emit(
+                    self.progress.as_ref(),
+                    Progress::Failed {
+                        page,
+                        stage,
+                        model,
+                        elapsed,
+                        timing,
+                        commit_elapsed: std::time::Duration::ZERO,
+                        error: format!("{error:#}"),
+                    },
+                );
+                return Err(error);
+            }
+        };
+        match outcome {
             StageOutcome::Stopped => {}
             StageOutcome::Skipped => {
                 self.mark_complete(page, stage);
-                progress::emit(self.progress.as_ref(), Progress::Skipped { page, stage });
+                progress::emit(
+                    self.progress.as_ref(),
+                    Progress::Skipped {
+                        page,
+                        stage,
+                        model,
+                        elapsed,
+                        timing,
+                    },
+                );
             }
             StageOutcome::Patch(patch) => {
-                if !self.commit_patch(page, stage, patch).await? {
-                    return Ok(());
-                }
+                let committing = std::time::Instant::now();
+                let commit_elapsed = match self.commit_patch(page, stage, patch).await {
+                    Ok(true) => committing.elapsed(),
+                    Ok(false) => return Ok(()),
+                    Err(error) => {
+                        progress::emit(
+                            self.progress.as_ref(),
+                            Progress::Failed {
+                                page,
+                                stage,
+                                model,
+                                elapsed,
+                                timing,
+                                commit_elapsed: committing.elapsed(),
+                                error: format!("{error:#}"),
+                            },
+                        );
+                        return Err(error);
+                    }
+                };
                 self.mark_complete(page, stage);
                 progress::emit(
                     self.progress.as_ref(),
@@ -184,6 +261,8 @@ impl<'a> Execution<'a> {
                         stage,
                         model,
                         elapsed,
+                        timing,
+                        commit_elapsed,
                     },
                 );
             }

@@ -5,11 +5,11 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, Result};
-use koharu_pipeline::{Committer, Progress, RunStatus, StageOutput, StopToken};
+use koharu_pipeline::{Committer, Progress, RunStatus, Stage, StageOutput, StageTiming, StopToken};
 use koharu_scene::{EntityId, Snapshot};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,69 @@ use super::{ChannelExt as _, Error, canvas::CanvasChannel, project::CurrentProje
 use koharu_desktop::Desktop;
 
 mod timing;
+
+fn page_stage_timing(
+    page: EntityId,
+    page_number: Option<usize>,
+    stage: Stage,
+    model: Option<String>,
+    outcome: &str,
+    elapsed: Duration,
+    stage_timing: StageTiming,
+    commit_elapsed: Duration,
+) -> timing::PageStageTiming {
+    let measured = stage_timing.accelerator_wait
+        + stage_timing.recovery
+        + stage_timing.model_load
+        + stage_timing.process;
+    timing::PageStageTiming {
+        page_number,
+        page_id: page.to_string(),
+        stage,
+        model,
+        outcome: outcome.to_owned(),
+        duration_ms: elapsed.as_millis() + commit_elapsed.as_millis(),
+        accelerator_wait_ms: stage_timing.accelerator_wait.as_millis(),
+        recovery_ms: stage_timing.recovery.as_millis(),
+        model_load_ms: stage_timing.model_load.as_millis(),
+        process_ms: stage_timing.process.as_millis(),
+        commit_ms: commit_elapsed.as_millis(),
+        other_ms: elapsed.saturating_sub(measured).as_millis(),
+    }
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+
+    #[test]
+    fn page_timing_separates_stage_phases_and_commit() {
+        let timing = page_stage_timing(
+            EntityId::new(),
+            Some(4),
+            Stage::Ocr,
+            Some("ocr-model".into()),
+            "completed",
+            Duration::from_millis(1_200),
+            StageTiming {
+                accelerator_wait: Duration::from_millis(100),
+                recovery: Duration::ZERO,
+                model_load: Duration::from_millis(200),
+                process: Duration::from_millis(800),
+            },
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(timing.page_number, Some(4));
+        assert_eq!(timing.stage, Stage::Ocr);
+        assert_eq!(timing.duration_ms, 1_250);
+        assert_eq!(timing.accelerator_wait_ms, 100);
+        assert_eq!(timing.model_load_ms, 200);
+        assert_eq!(timing.process_ms, 800);
+        assert_eq!(timing.commit_ms, 50);
+        assert_eq!(timing.other_ms, 100);
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize, Type)]
 #[serde(transparent)]
@@ -188,10 +251,34 @@ fn start_processing(
     let logged_operation = operation.clone();
     let page_count = Arc::new(AtomicUsize::new(0));
     let stage_count = Arc::new(AtomicUsize::new(0));
+    let page_numbers = Arc::new(Mutex::new(HashMap::<EntityId, usize>::new()));
+    let page_stage_timings = Arc::new(Mutex::new(Vec::<timing::PageStageTiming>::new()));
     drop(tokio::spawn(async move {
         let progress = Arc::new(Mutex::new((0_usize, 0_usize)));
         let page_count_handle = page_count.clone();
         let stage_count_handle = stage_count.clone();
+        let page_numbers_handle = page_numbers.clone();
+        let page_stage_timings_handle = page_stage_timings.clone();
+        let record_page_numbers_handle = page_numbers_handle.clone();
+        let record_page_stage = move |page: EntityId,
+                                      stage: Stage,
+                                      model: Option<String>,
+                                      outcome: &str,
+                                      elapsed: Duration,
+                                      stage_timing: StageTiming,
+                                      commit_elapsed: Duration| {
+            let page_number = record_page_numbers_handle.lock().get(&page).copied();
+            page_stage_timings_handle.lock().push(page_stage_timing(
+                page,
+                page_number,
+                stage,
+                model,
+                outcome,
+                elapsed,
+                stage_timing,
+                commit_elapsed,
+            ));
+        };
         let progress_state = progress.clone();
         let progress_handle = task_handle.clone();
         let mut request = koharu_pipeline::Request {
@@ -206,6 +293,12 @@ fn start_processing(
                 Progress::Started { pages, stages } => {
                     page_count_handle.store(pages.len(), Ordering::Relaxed);
                     stage_count_handle.store(stages.len(), Ordering::Relaxed);
+                    *page_numbers_handle.lock() = pages
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .map(|(index, page)| (page, index + 1))
+                        .collect();
                     tracing::info!(
                         job = %id,
                         page_count = pages.len(),
@@ -244,13 +337,29 @@ fn start_processing(
                     stage,
                     model,
                     elapsed,
+                    timing,
+                    commit_elapsed,
                 } => {
+                    record_page_stage(
+                        page,
+                        stage,
+                        Some(model.clone()),
+                        "completed",
+                        elapsed,
+                        timing,
+                        commit_elapsed,
+                    );
                     tracing::info!(
                         job = %id,
                         %page,
                         %stage,
                         %model,
-                        duration_ms = elapsed.as_secs_f64() * 1000.0,
+                        duration_ms = (elapsed + commit_elapsed).as_secs_f64() * 1000.0,
+                        accelerator_wait_ms = timing.accelerator_wait.as_secs_f64() * 1000.0,
+                        recovery_ms = timing.recovery.as_secs_f64() * 1000.0,
+                        model_load_ms = timing.model_load.as_secs_f64() * 1000.0,
+                        process_ms = timing.process.as_secs_f64() * 1000.0,
+                        commit_ms = commit_elapsed.as_secs_f64() * 1000.0,
                         "pipeline stage finished",
                     );
                     if stage != koharu_pipeline::Stage::Translation {
@@ -266,11 +375,32 @@ fn start_processing(
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
                     Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
-                Progress::Skipped { page, stage } => {
+                Progress::Skipped {
+                    page,
+                    stage,
+                    model,
+                    elapsed,
+                    timing,
+                } => {
+                    record_page_stage(
+                        page,
+                        stage,
+                        Some(model.clone()),
+                        "skipped",
+                        elapsed,
+                        timing,
+                        Duration::ZERO,
+                    );
                     tracing::info!(
                         job = %id,
                         %page,
                         %stage,
+                        %model,
+                        duration_ms = elapsed.as_secs_f64() * 1000.0,
+                        accelerator_wait_ms = timing.accelerator_wait.as_secs_f64() * 1000.0,
+                        recovery_ms = timing.recovery.as_secs_f64() * 1000.0,
+                        model_load_ms = timing.model_load.as_secs_f64() * 1000.0,
+                        process_ms = timing.process.as_secs_f64() * 1000.0,
                         "pipeline stage skipped",
                     );
                     tracing::info!(
@@ -280,7 +410,43 @@ fn start_processing(
                     );
                     let mut progress = progress_state.lock();
                     progress.0 = progress.0.saturating_add(1).min(progress.1);
-                    Some((progress.0, progress.1, Some(page), Some(stage), None))
+                    Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
+                }
+                Progress::Failed {
+                    page,
+                    stage,
+                    model,
+                    elapsed,
+                    timing,
+                    commit_elapsed,
+                    error,
+                } => {
+                    record_page_stage(
+                        page,
+                        stage,
+                        Some(model.clone()),
+                        "failed",
+                        elapsed,
+                        timing,
+                        commit_elapsed,
+                    );
+                    tracing::error!(
+                        job = %id,
+                        %page,
+                        %stage,
+                        %model,
+                        duration_ms = (elapsed + commit_elapsed).as_secs_f64() * 1000.0,
+                        accelerator_wait_ms = timing.accelerator_wait.as_secs_f64() * 1000.0,
+                        recovery_ms = timing.recovery.as_secs_f64() * 1000.0,
+                        model_load_ms = timing.model_load.as_secs_f64() * 1000.0,
+                        process_ms = timing.process.as_secs_f64() * 1000.0,
+                        commit_ms = commit_elapsed.as_secs_f64() * 1000.0,
+                        %error,
+                        "pipeline stage failed",
+                    );
+                    let mut progress = progress_state.lock();
+                    progress.0 = progress.0.saturating_add(1).min(progress.1);
+                    Some((progress.0, progress.1, Some(page), Some(stage), Some(model)))
                 }
                 Progress::Running { page, stage, model } => {
                     tracing::info!(
@@ -392,6 +558,7 @@ fn start_processing(
             stage_count: stage_count.load(Ordering::Relaxed),
             completed_steps,
             total_steps,
+            page_stages: page_stage_timings.lock().clone(),
             error: error.clone(),
         };
         let timing_path = koharu_config::path().and_then(|config_path| {
